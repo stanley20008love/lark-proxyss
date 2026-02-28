@@ -1,4 +1,4 @@
-// 飞书机器人 - AI 超级智能版 (NVIDIA NIM API + GLM5)
+// 飞书机器人 - AI 超级智能版 (实时搜索 + GLM5)
 const LARK_APP_ID = process.env.LARK_APP_ID || 'cli_a9f678dd01b8de1b';
 const LARK_APP_SECRET = process.env.LARK_APP_SECRET || '4NJnbgKT1cGjc8ddKhrjNcrEgsCT368K';
 const LARK_API = 'https://open.larksuite.com/open-apis';
@@ -7,30 +7,21 @@ const LARK_API = 'https://open.larksuite.com/open-apis';
 const NVIDIA_API_KEY = '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';
 const NVIDIA_API = 'https://integrate.api.nvidia.com/v1/chat/completions';
 
-// 可用的顶级模型
+// AI 模型
 const AI_MODELS = {
-  // 中文最佳 - 默认使用
   'glm5': 'z-ai/glm5',
   'glm4': 'z-ai/glm4.7',
-  
-  // 超大模型
-  'llama-405b': 'meta/llama-3.1-405b-instruct',
-  'deepseek-v3': 'deepseek-ai/deepseek-v3.1',
-  'mistral-large': 'mistralai/mistral-large-3-675b-instruct-2512',
+  'deepseek': 'deepseek-ai/deepseek-v3.1',
   'qwen3': 'qwen/qwen3-235b-a22b',
-  
-  // 快速响应
   'llama-70b': 'meta/llama-3.1-70b-instruct',
-  'llama-33-70b': 'meta/llama-3.3-70b-instruct',
   'kimi': 'moonshotai/kimi-k2-instruct',
-  
-  // 默认模型
   'default': 'z-ai/glm5'
 };
 
 let tokenCache = { token: null, expire: 0 };
 
-// 获取飞书 Token
+// ============== 飞书 API ==============
+
 async function getLarkToken() {
   const now = Date.now() / 1000;
   if (tokenCache.token && now < tokenCache.expire) return tokenCache.token;
@@ -49,56 +40,153 @@ async function getLarkToken() {
   return null;
 }
 
-// 发送私聊消息
 async function sendLarkMessage(openId, message) {
   const token = await getLarkToken();
   if (!token) return false;
   try {
-    const res = await fetch(`${LARK_API}/im/v1/messages?receive_id_type=open_id`, {
+    await fetch(`${LARK_API}/im/v1/messages?receive_id_type=open_id`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ receive_id: openId, msg_type: 'text', content: JSON.stringify({ text: message }) })
     });
-    const result = await res.json();
-    return result.code === 0;
+    return true;
   } catch (e) { return false; }
 }
 
-// 回复群消息
 async function replyLarkMessage(messageId, message) {
   const token = await getLarkToken();
   if (!token) return false;
   try {
-    const res = await fetch(`${LARK_API}/im/v1/messages/${messageId}/reply`, {
+    await fetch(`${LARK_API}/im/v1/messages/${messageId}/reply`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ msg_type: 'text', content: JSON.stringify({ text: message }) })
     });
-    const result = await res.json();
-    return result.code === 0;
+    return true;
   } catch (e) { return false; }
 }
 
-// 发送到群聊
 async function sendToGroup(chatId, message) {
   const token = await getLarkToken();
   if (!token) return false;
   try {
-    const res = await fetch(`${LARK_API}/im/v1/messages?receive_id_type=chat_id`, {
+    await fetch(`${LARK_API}/im/v1/messages?receive_id_type=chat_id`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ receive_id: chatId, msg_type: 'text', content: JSON.stringify({ text: message }) })
     });
-    const result = await res.json();
-    return result.code === 0;
+    return true;
   } catch (e) { return false; }
 }
 
-// ============== NVIDIA NIM AI 对话 ==============
+// ============== 实时搜索功能 ==============
 
-async function chatWithNVIDIA(message, model = 'default') {
-  const modelId = AI_MODELS[model] || AI_MODELS.default;
-  
+// DuckDuckGo 即时搜索 (免费无需API)
+async function searchWeb(query, numResults = 5) {
+  try {
+    const res = await fetch(`https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1`, {
+      timeout: 8000
+    });
+    const data = await res.json();
+    
+    let results = [];
+    
+    // 即时回答
+    if (data.AbstractText) {
+      results.push({ title: '摘要', snippet: data.AbstractText, url: data.AbstractURL });
+    }
+    
+    // 相关主题
+    if (data.RelatedTopics) {
+      for (const topic of data.RelatedTopics.slice(0, numResults)) {
+        if (topic.Text && topic.FirstURL) {
+          results.push({ title: topic.Text.substring(0, 50), snippet: topic.Text, url: topic.FirstURL });
+        }
+      }
+    }
+    
+    return results.length > 0 ? results : null;
+  } catch (e) {
+    console.error('DuckDuckGo 搜索失败:', e);
+    return null;
+  }
+}
+
+// 加密货币新闻搜索
+async function searchCryptoNews(query = 'bitcoin cryptocurrency news today') {
+  try {
+    const res = await fetch(`https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1`, {
+      timeout: 8000
+    });
+    const data = await res.json();
+    return data;
+  } catch (e) {
+    console.error('新闻搜索失败:', e);
+    return null;
+  }
+}
+
+// 获取加密货币热搜
+async function getCryptoTrending() {
+  try {
+    const res = await fetch('https://api.coingecko.com/api/v3/search/trending', { timeout: 8000 });
+    const data = await res.json();
+    
+    if (data.coins) {
+      let msg = '🔥 加密货币热搜榜\n\n';
+      for (let i = 0; i < Math.min(7, data.coins.length); i++) {
+        const coin = data.coins[i].item;
+        msg += `${i + 1}. ${coin.name} (${coin.symbol})\n`;
+        msg += `   市值排名: #${coin.market_cap_rank || 'N/A'}\n`;
+      }
+      msg += `\n⏰ ${new Date().toLocaleTimeString()}\n📍 CoinGecko`;
+      return msg;
+    }
+  } catch (e) {
+    console.error('热搜获取失败:', e);
+  }
+  return '❌ 无法获取热搜数据';
+}
+
+// 获取恐惧贪婪指数
+async function getFearGreedIndex() {
+  try {
+    const res = await fetch('https://api.alternative.me/fng/', { timeout: 8000 });
+    const data = await res.json();
+    
+    if (data.data && data.data[0]) {
+      const fng = data.data[0];
+      const value = parseInt(fng.value);
+      const classification = fng.value_classification;
+      
+      let emoji = '😐';
+      if (value <= 25) emoji = '😱';
+      else if (value <= 45) emoji = '😰';
+      else if (value <= 55) emoji = '😐';
+      else if (value <= 75) emoji = '😊';
+      else emoji = '🤑';
+      
+      return `${emoji} 恐惧贪婪指数
+
+📊 当前: ${value} (${classification})
+
+📈 极端贪婪: 75-100
+😊 贪婪: 55-75
+😐 中性: 45-55
+😰 恐惧: 25-45
+😱 极端恐惧: 0-25
+
+⏰ ${new Date().toLocaleTimeString()}`;
+    }
+  } catch (e) {
+    console.error('恐惧贪婪指数获取失败:', e);
+  }
+  return '❌ 无法获取恐惧贪婪指数';
+}
+
+// ============== NVIDIA AI 对话 ==============
+
+async function chatWithNVIDIA(message, context = null) {
   const system = `你是AI Agent，一个专业的加密货币和区块链智能助手。
 
 核心能力：
@@ -106,13 +194,16 @@ async function chatWithNVIDIA(message, model = 'default') {
 🔗 区块链技术与DeFi知识解答
 🎯 Polymarket预测市场分析
 📈 市场趋势与投资策略建议
+🔍 实时新闻和热点搜索
 ⚠️ 风险管理与投资警示
 
 回复风格：
 - 专业但易懂
 - 使用表情符号增加可读性
 - 提供有价值的深度信息
-- 投资相关问题必须提醒风险`;
+- 投资相关问题必须提醒风险
+
+${context ? `\n当前上下文信息：\n${context}` : ''}`;
 
   try {
     const res = await fetch(NVIDIA_API, {
@@ -122,21 +213,19 @@ async function chatWithNVIDIA(message, model = 'default') {
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        model: modelId,
+        model: AI_MODELS.default,
         messages: [
           { role: 'system', content: system },
           { role: 'user', content: message }
         ],
         temperature: 0.7,
-        max_tokens: 1500
+        max_tokens: 2000
       })
     });
     
     if (res.ok) {
       const data = await res.json();
       return data.choices?.[0]?.message?.content || null;
-    } else {
-      console.error('NVIDIA API error:', res.status);
     }
   } catch (e) {
     console.error('AI 对话失败:', e);
@@ -144,7 +233,24 @@ async function chatWithNVIDIA(message, model = 'default') {
   return null;
 }
 
-// ============== 加密货币数据 ==============
+// 带搜索增强的 AI 对话
+async function chatWithSearch(query) {
+  // 先搜索
+  const searchResults = await searchWeb(query);
+  
+  let context = '';
+  if (searchResults && searchResults.length > 0) {
+    context = '搜索结果：\n';
+    for (const r of searchResults.slice(0, 3)) {
+      context += `- ${r.snippet}\n`;
+    }
+  }
+  
+  // 结合搜索结果回答
+  return await chatWithNVIDIA(query, context);
+}
+
+// ============== 价格数据 ==============
 
 async function getBtcPrice() {
   try {
@@ -153,7 +259,7 @@ async function getBtcPrice() {
     const price = parseFloat(data.price).toLocaleString('en-US', { minimumFractionDigits: 2 });
     return `🪙 BTC/USDT\n💰 $${price}\n📍 Binance\n⏰ ${new Date().toLocaleTimeString()}`;
   } catch (e) {
-    return '❌ 获取 BTC 价格失败，请稍后重试';
+    return '❌ 获取 BTC 价格失败';
   }
 }
 
@@ -164,7 +270,7 @@ async function getEthPrice() {
     const price = parseFloat(data.price).toLocaleString('en-US', { minimumFractionDigits: 2 });
     return `💎 ETH/USDT\n💰 $${price}\n📍 Binance\n⏰ ${new Date().toLocaleTimeString()}`;
   } catch (e) {
-    return '❌ 获取 ETH 价格失败，请稍后重试';
+    return '❌ 获取 ETH 价格失败';
   }
 }
 
@@ -174,7 +280,6 @@ async function getAllCryptoPrices() {
     const data = await res.json();
     
     let msg = '📊 加密货币实时行情\n\n';
-    
     const coins = [
       { id: 'bitcoin', symbol: '🪙 BTC' },
       { id: 'ethereum', symbol: '💎 ETH' },
@@ -193,37 +298,11 @@ async function getAllCryptoPrices() {
         msg += `${coin.symbol}: $${price} ${changeStr}\n`;
       }
     }
-    
     msg += `\n⏰ ${new Date().toLocaleTimeString()}`;
     return msg;
   } catch (e) {
     return '❌ 无法获取价格数据';
   }
-}
-
-async function getMarketOverview() {
-  try {
-    const res = await fetch('https://api.coingecko.com/api/v3/global', { timeout: 8000 });
-    const data = await res.json();
-    
-    if (data.data) {
-      const btcDom = data.data.market_cap_percentage?.btc?.toFixed(1);
-      const ethDom = data.data.market_cap_percentage?.eth?.toFixed(1);
-      const totalMcap = (data.data.total_market_cap?.usd / 1e12)?.toFixed(2);
-      const change = data.data.market_cap_change_percentage_24h_usd?.toFixed(2);
-      
-      return `🌍 市场概览
-
-💰 总市值: $${totalMcap}T
-📊 24h: ${change > 0 ? '📈' : '📉'} ${change}%
-
-👑 BTC: ${btcDom}%
-💎 ETH: ${ethDom}%
-
-⏰ ${new Date().toLocaleTimeString()}`;
-    }
-  } catch (e) {}
-  return '❌ 无法获取市场数据';
 }
 
 // ============== 消息处理 ==============
@@ -234,88 +313,73 @@ async function processMessage(text) {
   // 帮助
   if (t === 'help' || t === '/help' || t === '?' || t === '帮助' || t === '菜单') {
     return `🤖 AI Agent 超级智能助手
-📍 默认模型: GLM5 (智谱AI)
+📍 模型: GLM5 (智谱AI) + 实时搜索
 
 📊 行情查询:
   btc - 比特币价格
   eth - 以太坊价格
   crypto - 主流币行情
-  market - 市场概览
+  trending - 热搜榜
+  fng - 恐惧贪婪指数
 
-🎯 Polymarket:
-  polymarket - 预测市场
+🔍 实时搜索:
+  news [关键词] - 搜索新闻
+  search [关键词] - 网页搜索
+  例如: news bitcoin
 
 💡 AI 智能对话:
-  直接问任何问题，例如:
-  "BTC后市怎么看？"
-  "什么是DeFi？"
-  "分析一下当前市场"
-  "如何进行风险管理？"
-
-🧠 可用模型:
-  glm5, glm4, deepseek, qwen3
-  llama-405b, kimi 等
+  直接问任何问题，AI会结合
+  实时信息回答你
 
 📝 其他:
   time - 时间
   help - 帮助`;
   }
   
-  // 价格查询
-  if (t === 'btc' || t === '比特币' || t === 'bitcoin') {
-    return await getBtcPrice();
-  }
-  if (t === 'eth' || t === '以太坊' || t === 'ethereum') {
-    return await getEthPrice();
-  }
-  if (t === 'crypto' || t === '行情' || t === '币价') {
-    return await getAllCryptoPrices();
-  }
-  if (t === 'market' || t === '市场') {
-    return await getMarketOverview();
+  // 价格
+  if (t === 'btc' || t === '比特币') return await getBtcPrice();
+  if (t === 'eth' || t === '以太坊') return await getEthPrice();
+  if (t === 'crypto' || t === '行情') return await getAllCryptoPrices();
+  if (t === 'trending' || t === '热搜') return await getCryptoTrending();
+  if (t === 'fng' || t === '恐惧贪婪' || t === '指数') return await getFearGreedIndex();
+  
+  // 新闻搜索
+  if (t.startsWith('news ')) {
+    const query = text.substring(5).trim();
+    const results = await searchWeb(query + ' cryptocurrency news');
+    if (results) {
+      let msg = `📰 新闻搜索: ${query}\n\n`;
+      for (const r of results.slice(0, 5)) {
+        msg += `• ${r.snippet.substring(0, 100)}...\n\n`;
+      }
+      return msg;
+    }
+    return '❌ 未找到相关新闻';
   }
   
-  // Polymarket
-  if (t === 'polymarket' || t.includes('预测市场')) {
-    return `🎯 Polymarket 预测市场
-
-📈 BTC Up or Down 15分钟
-预测 BTC 15分钟内涨跌
-
-🔗 polymarket.com
-
-💡 可以问我:
-  "如何分析预测市场？"
-  "Polymarket怎么玩？"`;
+  // 网页搜索
+  if (t.startsWith('search ')) {
+    const query = text.substring(7).trim();
+    const aiReply = await chatWithSearch(query);
+    return aiReply || '❌ 搜索失败';
   }
   
   // 时间
   if (t === 'time' || t === '时间') {
-    const now = new Date();
-    return `🕐 ${now.toISOString().replace('T', ' ').substring(0, 19)} UTC`;
+    return `🕐 ${new Date().toISOString().replace('T', ' ').substring(0, 19)} UTC`;
   }
   
-  // 切换模型
-  if (t.startsWith('model ')) {
-    const model = text.substring(6).trim().toLowerCase();
-    if (AI_MODELS[model]) {
-      return `✅ 已切换到模型: ${model}\n\n可用模型: ${Object.keys(AI_MODELS).filter(k => k !== 'default').join(', ')}`;
-    }
-    return `❌ 未知模型: ${model}\n\n可用模型: ${Object.keys(AI_MODELS).filter(k => k !== 'default').join(', ')}`;
-  }
-  
-  // 默认：AI 智能回复
-  const aiReply = await chatWithNVIDIA(text);
-  if (aiReply) {
-    return aiReply;
-  }
+  // 默认：AI 智能回复 (带搜索增强)
+  const aiReply = await chatWithSearch(text);
+  if (aiReply) return aiReply;
   
   return `🤖 AI 暂时无法响应
 
 💡 试试这些命令:
   btc - BTC价格
-  eth - ETH价格  
   crypto - 所有行情
+  trending - 热搜榜
+  news btc - BTC新闻
   help - 帮助`;
 }
 
@@ -326,17 +390,14 @@ export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   
-  if (req.method === 'OPTIONS') {
-    return res.status(200).end();
-  }
+  if (req.method === 'OPTIONS') return res.status(200).end();
   
   if (req.method === 'GET') {
     return res.status(200).json({ 
       status: 'ok', 
       service: 'lark-ai-super-agent',
-      version: '5.0.0',
-      default_model: 'GLM5 (智谱AI)',
-      models: Object.keys(AI_MODELS).filter(k => k !== 'default')
+      version: '6.0.0',
+      features: ['GLM5 AI', 'Real-time Search', 'Crypto Data', 'News Aggregation']
     });
   }
   
@@ -345,12 +406,10 @@ export default async function handler(req, res) {
     try { body = JSON.parse(body); } catch (e) {}
   }
   
-  // URL验证
   if (body && body.type === 'url_verification') {
     return res.status(200).json({ challenge: String(body.challenge || '') });
   }
   
-  // 处理消息
   try {
     if (body && body.header && body.header.event_type === 'im.message.receive_v1') {
       const msg = body.event?.message || {};
@@ -369,31 +428,22 @@ export default async function handler(req, res) {
           text = msg.content || '';
         }
         
-        // 移除 @机器人
         const mentions = msg.mentions || [];
         for (const mention of mentions) {
-          if (mention.key) {
-            text = text.replace(mention.key, '').trim();
-          }
+          if (mention.key) text = text.replace(mention.key, '').trim();
         }
         
         text = text.trim();
         
         if (text) {
           console.log(`消息: "${text}" (${chatType})`);
-          
           const reply = await processMessage(text);
           
           if (chatType === 'group') {
-            if (messageId) {
-              await replyLarkMessage(messageId, reply);
-            } else if (chatId) {
-              await sendToGroup(chatId, reply);
-            }
+            if (messageId) await replyLarkMessage(messageId, reply);
+            else if (chatId) await sendToGroup(chatId, reply);
           } else {
-            if (openId) {
-              await sendLarkMessage(openId, reply);
-            }
+            if (openId) await sendLarkMessage(openId, reply);
           }
         }
       }
