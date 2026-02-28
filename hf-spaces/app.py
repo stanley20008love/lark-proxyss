@@ -14,13 +14,17 @@ import json
 import asyncio
 import logging
 import time
-from typing import List, Dict, Optional
+import math
+from typing import List, Dict, Optional, Tuple
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from enum import Enum
 
 import gradio as gr
 import httpx
+import numpy as np
+from scipy import stats
+from scipy.optimize import brentq
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -306,8 +310,145 @@ class PolymarketSuperBot:
         }
 
 
-# Create bot instance
+# ==================== Black-Scholes Binary Options Pricing ====================
+
+class BlackScholesBinary:
+    """
+    Black-Scholes 二元期权定价模型
+    
+    Polymarket 的涨跌市场本质上是二元期权：
+    - 如果事件发生，支付 $1
+    - 如果事件不发生，支付 $0
+    
+    二元看涨期权定价公式：
+    C_binary = e^(-rT) * N(d2)
+    """
+    
+    def __init__(self, risk_free_rate: float = 0.05):
+        self.r = risk_free_rate
+    
+    def d2(self, S: float, K: float, T: float, sigma: float) -> float:
+        if T <= 0 or sigma <= 0:
+            return 0
+        return (math.log(S / K) + (self.r - 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+    
+    def binary_call_price(self, S: float, K: float, T: float, sigma: float) -> float:
+        """二元看涨期权定价 (Yes/Up)"""
+        if T <= 0:
+            return 1.0 if S >= K else 0.0
+        if sigma <= 0:
+            sigma = 0.01
+        d2 = self.d2(S, K, T, sigma)
+        price = math.exp(-self.r * T) * stats.norm.cdf(d2)
+        return max(0.001, min(0.999, price))
+    
+    def binary_put_price(self, S: float, K: float, T: float, sigma: float) -> float:
+        """二元看跌期权定价 (No/Down)"""
+        if T <= 0:
+            return 1.0 if S < K else 0.0
+        d2 = self.d2(S, K, T, sigma)
+        price = math.exp(-self.r * T) * stats.norm.cdf(-d2)
+        return max(0.001, min(0.999, price))
+    
+    def implied_volatility(self, market_price: float, S: float, K: float, T: float, is_call: bool = True) -> float:
+        """从市场价格反推隐含波动率"""
+        if T <= 0:
+            return 0.0
+        
+        def price_diff(sigma):
+            if is_call:
+                model_price = self.binary_call_price(S, K, T, sigma)
+            else:
+                model_price = self.binary_put_price(S, K, T, sigma)
+            return model_price - market_price
+        
+        try:
+            p_low = price_diff(0.001)
+            p_high = price_diff(5.0)
+            if p_low * p_high > 0:
+                return 0.5
+            iv = brentq(price_diff, 0.001, 5.0, maxiter=100)
+            return iv
+        except:
+            return 0.5
+
+
+class BinaryOptionsAnalyzer:
+    """二元期权分析器"""
+    
+    def __init__(self):
+        self.bs = BlackScholesBinary()
+    
+    def analyze(self, current_price: float, target_price: float, 
+                time_to_expiry_minutes: float, market_yes_price: float,
+                volatility: float = 0.5, fee_rate: float = 0.02) -> Dict:
+        """
+        分析涨跌市场
+        
+        Args:
+            current_price: 当前资产价格 (如 BTC 当前价格)
+            target_price: 目标价格 (行权价)
+            time_to_expiry_minutes: 到期时间 (分钟)
+            market_yes_price: 市场 Yes 价格 (0-1)
+            volatility: 波动率 (年化)
+            fee_rate: 手续费率
+        """
+        # 转换时间
+        T = time_to_expiry_minutes / (60 * 24 * 365)  # 转换为年
+        
+        # 计算理论价格
+        theoretical_yes = self.bs.binary_call_price(current_price, target_price, T, volatility)
+        theoretical_no = self.bs.binary_put_price(current_price, target_price, T, volatility)
+        
+        # 计算定价偏差
+        mispricing_yes = theoretical_yes - market_yes_price
+        mispricing_no = theoretical_no - (1 - market_yes_price)
+        
+        # 计算优势 (扣除费用)
+        edge_yes = mispricing_yes - fee_rate
+        edge_no = mispricing_no - fee_rate
+        
+        # 反推隐含波动率
+        iv_yes = self.bs.implied_volatility(market_yes_price, current_price, target_price, T, True)
+        iv_no = self.bs.implied_volatility(1 - market_yes_price, current_price, target_price, T, False)
+        
+        # 计算置信度
+        confidence = min(1.0, max(0, abs(mispricing_yes) * 5))
+        
+        # 生成推荐
+        if edge_yes > 0.02:
+            recommendation = f"✅ 买入 YES (Edge: {edge_yes:.2%})"
+        elif edge_no > 0.02:
+            recommendation = f"✅ 买入 NO (Edge: {edge_no:.2%})"
+        elif edge_yes > 0:
+            recommendation = f"💡 可考虑 YES (Edge: {edge_yes:.2%})"
+        elif edge_no > 0:
+            recommendation = f"💡 可考虑 NO (Edge: {edge_no:.2%})"
+        else:
+            recommendation = "⛔ 无交易优势"
+        
+        return {
+            "current_price": current_price,
+            "target_price": target_price,
+            "time_to_expiry": f"{time_to_expiry_minutes:.1f} 分钟",
+            "market_yes_price": f"{market_yes_price:.2%}",
+            "theoretical_yes": f"{theoretical_yes:.2%}",
+            "theoretical_no": f"{theoretical_no:.2%}",
+            "mispricing_yes": f"{mispricing_yes:+.2%}",
+            "mispricing_no": f"{mispricing_no:+.2%}",
+            "edge_yes": f"{edge_yes:+.2%}",
+            "edge_no": f"{edge_no:+.2%}",
+            "implied_vol_yes": f"{iv_yes:.1%}",
+            "implied_vol_no": f"{iv_no:.1%}",
+            "used_volatility": f"{volatility:.1%}",
+            "confidence": f"{confidence:.0%}",
+            "recommendation": recommendation
+        }
+
+
+# Create instances
 bot = PolymarketSuperBot()
+bs_analyzer = BinaryOptionsAnalyzer()
 
 
 # ==================== Message Processing ====================
@@ -536,8 +677,53 @@ with gr.Blocks(title="Polymarket Super Bot", theme=gr.themes.Soft()) as demo:
                 outputs=trade_result
             )
         
-        # Tab 7: Config
-        with gr.TabItem("⚙️ 配置"):
+        # Tab 7: Binary Options Pricing
+        with gr.TabItem("📐 BS定价"):
+            gr.Markdown("""
+            ### Black-Scholes 二元期权定价
+            
+            Polymarket 涨跌市场本质上是二元期权。使用 BS 模型计算公允价格。
+            
+            **核心参数**:
+            - 隐含波动率 (σ): 最难估算的参数，需要研究或历史数据建模
+            - 到期时间 (T): 15分钟市场 = 0.0000285年
+            - 目标价格 (K): 行权价
+            
+            **策略**: 当理论价格与市场价格偏差足够大时 (Edge > 2%)，才有交易优势
+            """)
+            
+            with gr.Row():
+                bs_current = gr.Number(label="当前价格 (如 BTC)", value=95000)
+                bs_target = gr.Number(label="目标价格 (行权价)", value=95000)
+            with gr.Row():
+                bs_expiry = gr.Number(label="到期时间 (分钟)", value=15)
+                bs_market = gr.Number(label="市场 Yes 价格", value=0.52)
+            with gr.Row():
+                bs_vol = gr.Slider(label="波动率 (年化)", minimum=0.1, maximum=2.0, value=0.5, step=0.05)
+                bs_fee = gr.Slider(label="手续费率", minimum=0.01, maximum=0.05, value=0.02, step=0.005)
+            
+            bs_btn = gr.Button("📊 计算公允价格", variant="primary")
+            bs_result = gr.Code(label="定价分析", language="json")
+            
+            bs_btn.click(
+                fn=lambda c, t, e, m, v, f: json.dumps(
+                    bs_analyzer.analyze(c, t, e, m, v, f), 
+                    indent=2, ensure_ascii=False
+                ),
+                inputs=[bs_current, bs_target, bs_expiry, bs_market, bs_vol, bs_fee],
+                outputs=bs_result
+            )
+            
+            gr.Markdown("""
+            ---
+            **⚠️ 风险提示**:
+            - 波动率估算是最关键的参数
+            - 临近到期时不要购买高价期权
+            - 简单延迟套利难以规模化盈利
+            """)
+        
+        # Tab 8: Config
+        with gr.TabItem("⚙️ 配置"): 
             gr.Markdown("### 做市商配置")
             with gr.Row():
                 mm_enabled = gr.Checkbox(label="启用做市商", value=False)
