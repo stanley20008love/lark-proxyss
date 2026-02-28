@@ -1,13 +1,12 @@
 """
-AI Agent - Polymarket Super Bot with Lark Integration
+Polymarket Super Bot - Enhanced with Binary Options Pricing
 
-整合功能:
-- 飞书机器人 Webhook
-- Polymarket 交易机器人
-- 做市商策略
-- 跨平台套利
-- 风险管理
-- 技术分析
+核心功能:
+1. Black-Scholes 二元期权定价模型
+2. Binance 实时数据源 (Alpha 来源)
+3. Maker/Taker 执行策略
+4. 波动率建模与预测
+5. 飞书 Webhook 集成
 """
 import os
 import json
@@ -15,16 +14,13 @@ import asyncio
 import logging
 import time
 import math
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from enum import Enum
 
 import gradio as gr
 import httpx
-import numpy as np
-from scipy import stats
-from scipy.optimize import brentq
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -33,27 +29,216 @@ log = logging.getLogger(__name__)
 # Configuration
 APP_ID = os.getenv("LARK_APP_ID", "cli_a9f678dd01b8de1b")
 APP_SECRET = os.getenv("LARK_APP_SECRET", "4NJnbgKT1cGjc8ddKhrjNcrEgsCT368K")
-NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "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")
 API = "https://open.lark.cn/open-apis"
 
-# Cache
 _cache = {"token": None, "expire": 0}
 
 
-# ==================== Enums & Data Classes ====================
+# ==================== Black-Scholes Binary Option Pricing ====================
 
-class RiskLevel(Enum):
-    LOW = "low"
-    MEDIUM = "medium"
-    HIGH = "high"
-    CRITICAL = "critical"
+def norm_cdf(x: float) -> float:
+    """标准正态分布累积分布函数"""
+    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
 
 
-class ArbitrageType(Enum):
-    CROSS_PLATFORM = "cross_platform"
-    INTRA_PLATFORM = "intra_platform"
-    TRIANGULAR = "triangular"
+def norm_pdf(x: float) -> float:
+    """标准正态分布概率密度函数"""
+    return math.exp(-0.5 * x ** 2) / math.sqrt(2 * math.pi)
 
+
+def price_binary_option(
+    S: float,  # 当前价格
+    K: float,  # 行权价
+    T: float,  # 到期时间 (年)
+    r: float = 0.05,  # 无风险利率
+    sigma: float = 0.5,  # 波动率
+    is_call: bool = True
+) -> float:
+    """
+    Black-Scholes 二元期权定价
+
+    二元看涨: C = e^(-rT) * N(d2)
+    二元看跌: P = e^(-rT) * N(-d2)
+
+    d1 = [ln(S/K) + (r + σ²/2)T] / (σ√T)
+    d2 = d1 - σ√T
+    """
+    if T <= 0 or sigma <= 0:
+        return 0.5
+
+    sqrt_T = math.sqrt(T)
+    d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * sqrt_T)
+    d2 = d1 - sigma * sqrt_T
+
+    if is_call:
+        price = math.exp(-r * T) * norm_cdf(d2)
+    else:
+        price = math.exp(-r * T) * norm_cdf(-d2)
+
+    return max(0.0, min(1.0, price))
+
+
+def calculate_implied_volatility(
+    market_price: float,
+    S: float,
+    K: float,
+    T: float,
+    r: float = 0.05,
+    is_call: bool = True,
+    max_iter: int = 100
+) -> Optional[float]:
+    """计算隐含波动率 (Newton-Raphson 方法)"""
+    sigma = 0.5  # 初始猜测
+
+    for _ in range(max_iter):
+        theo = price_binary_option(S, K, T, r, sigma, is_call)
+        diff = theo - market_price
+
+        if abs(diff) < 1e-6:
+            return sigma
+
+        # 计算 Vega
+        sqrt_T = math.sqrt(T)
+        d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * sqrt_T)
+        d2 = d1 - sigma * sqrt_T
+        vega = -math.exp(-r * T) * norm_pdf(d2) * d1 / sigma if sigma > 0 else 0
+
+        if abs(vega) < 1e-10:
+            break
+
+        sigma = sigma - diff / vega
+        sigma = max(0.01, min(5.0, sigma))
+
+    return sigma
+
+
+def calculate_historical_volatility(prices: List[float], annualize: bool = True) -> float:
+    """计算历史波动率"""
+    if len(prices) < 2:
+        return 0.5
+
+    returns = []
+    for i in range(1, len(prices)):
+        if prices[i] > 0 and prices[i-1] > 0:
+            returns.append(math.log(prices[i] / prices[i-1]))
+
+    if not returns:
+        return 0.5
+
+    mean = sum(returns) / len(returns)
+    variance = sum((r - mean) ** 2 for r in returns) / len(returns)
+
+    if annualize:
+        # 对于 15 分钟 K 线，一年约 35040 个周期
+        return math.sqrt(variance * 35040)
+    return math.sqrt(variance)
+
+
+# ==================== Execution Strategies ====================
+
+class StrategyType(Enum):
+    MARKET_MAKER = "market_maker"
+    TAKER = "taker"
+    HYBRID = "hybrid"
+
+
+@dataclass
+class TradeSignal:
+    market_id: str
+    signal: str  # BUY_YES, BUY_NO, HOLD
+    theoretical_price: float
+    market_price: float
+    edge: float
+    volatility: float
+    implied_vol: Optional[float]
+    strategy: StrategyType
+    confidence: float
+
+
+class ExecutionEngine:
+    """执行引擎"""
+
+    def __init__(self, strategy: StrategyType = StrategyType.TAKER):
+        self.strategy = strategy
+        self.min_edge = 0.02  # 2% 最小边际
+        self.maker_spread = 0.015  # 1.5% 价差
+        self.taker_slippage = 0.005  # 0.5% 滑点
+        self.daily_trades = 0
+        self.max_daily_trades = 50
+        self.circuit_breaker = False
+
+    def analyze(
+        self,
+        market_id: str,
+        current_price: float,
+        strike_price: float,
+        time_to_expiry_sec: float,
+        market_yes_price: float,
+        historical_prices: List[float] = None
+    ) -> TradeSignal:
+        """分析市场并生成交易信号"""
+
+        # 计算波动率
+        vol = calculate_historical_volatility(historical_prices) if historical_prices else 0.5
+
+        # 计算理论价格
+        T = time_to_expiry_sec / (365 * 24 * 3600)
+        theo = price_binary_option(current_price, strike_price, T, 0.05, vol)
+
+        # 计算边际
+        edge = theo - market_yes_price
+
+        # 计算隐含波动率
+        iv = calculate_implied_volatility(market_yes_price, current_price, strike_price, T)
+
+        # 生成信号
+        if self.strategy == StrategyType.TAKER:
+            # Taker 策略: 等待足够大的边际
+            min_edge_adjusted = self.min_edge + self.taker_slippage
+            if edge > min_edge_adjusted:
+                signal = "BUY_YES"
+                confidence = min(1.0, edge / 0.1)
+            elif edge < -min_edge_adjusted:
+                signal = "BUY_NO"
+                confidence = min(1.0, abs(edge) / 0.1)
+            else:
+                signal = "HOLD"
+                confidence = 0.5
+
+        elif self.strategy == StrategyType.MARKET_MAKER:
+            # Maker 策略: 根据价差挂单
+            if abs(edge) > self.min_edge:
+                signal = "MAKE_BOTH"
+                confidence = min(1.0, abs(edge) / self.maker_spread)
+            else:
+                signal = "HOLD"
+                confidence = 0.5
+
+        else:  # HYBRID
+            if abs(edge) > 0.05:
+                signal = "BUY_YES" if edge > 0 else "BUY_NO"
+                confidence = 0.9
+            elif abs(edge) > 0.02:
+                signal = "MAKE_BOTH"
+                confidence = 0.7
+            else:
+                signal = "HOLD"
+                confidence = 0.5
+
+        return TradeSignal(
+            market_id=market_id,
+            signal=signal,
+            theoretical_price=theo,
+            market_price=market_yes_price,
+            edge=edge,
+            volatility=vol,
+            implied_vol=iv,
+            strategy=self.strategy,
+            confidence=confidence
+        )
+
+
+# ==================== Market Data ====================
 
 @dataclass
 class Market:
@@ -62,23 +247,142 @@ class Market:
     yes_price: float
     no_price: float
     liquidity: float
-    platform: str = "Polymarket"
+    strike_price: float = 0
+    current_price: float = 0
+    expiry_minutes: int = 15
 
 
-@dataclass
-class Position:
-    market_id: str
-    side: str
-    size: float
-    entry_price: float
-    current_price: float
-    pnl: float
+class PolymarketBot:
+    """Polymarket Super Bot with Binary Options Pricing"""
+
+    def __init__(self):
+        self.markets = self._init_markets()
+        self.price_history: Dict[str, List[float]] = {}
+        self.execution_engine = ExecutionEngine(StrategyType.HYBRID)
+        self.stats = {
+            "trades": 0,
+            "pnl": 0.0,
+            "signals": 0
+        }
+
+    def _init_markets(self) -> List[Market]:
+        """初始化市场"""
+        return [
+            Market("btc_15m_up", "BTC up in 15 min?", 0.48, 0.52, 150000, 97000, 96500, 15),
+            Market("btc_5m_up", "BTC up in 5 min?", 0.50, 0.50, 100000, 97000, 96500, 5),
+            Market("eth_15m_up", "ETH up in 15 min?", 0.47, 0.53, 80000, 2700, 2680, 15),
+            Market("btc_100k", "BTC reaches $100k?", 0.72, 0.28, 200000, 100000, 96500, 15),
+            Market("eth_5k", "ETH exceeds $5,000?", 0.45, 0.55, 120000, 5000, 2700, 15),
+        ]
+
+    async def fetch_crypto_prices(self) -> Dict[str, float]:
+        """获取加密货币实时价格 (Binance)"""
+        prices = {}
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                # 批量获取价格
+                symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+                for symbol in symbols:
+                    r = await client.get(f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}")
+                    data = r.json()
+                    prices[symbol] = float(data.get("price", 0))
+
+                    # 更新历史价格
+                    if symbol not in self.price_history:
+                        self.price_history[symbol] = []
+                    self.price_history[symbol].append(prices[symbol])
+                    if len(self.price_history[symbol]) > 100:
+                        self.price_history[symbol] = self.price_history[symbol][-100:]
+
+        except Exception as e:
+            log.error(f"Error fetching prices: {e}")
+
+        return prices
+
+    def analyze_market(self, market_id: str) -> Dict:
+        """分析市场"""
+        market = next((m for m in self.markets if m.id == market_id), None)
+        if not market:
+            return {"error": "Market not found"}
+
+        # 获取历史价格
+        symbol = "BTCUSDT" if "btc" in market_id.lower() else "ETHUSDT"
+        history = self.price_history.get(symbol, [])
+
+        # 生成信号
+        signal = self.execution_engine.analyze(
+            market_id=market.id,
+            current_price=market.current_price,
+            strike_price=market.strike_price,
+            time_to_expiry_sec=market.expiry_minutes * 60,
+            market_yes_price=market.yes_price,
+            historical_prices=history
+        )
+
+        self.stats["signals"] += 1
+
+        return {
+            "market": market.question,
+            "current_price": f"${market.current_price:,.2f}",
+            "strike_price": f"${market.strike_price:,.2f}",
+            "time_to_expiry": f"{market.expiry_minutes} min",
+            "market_yes_price": f"{market.yes_price:.1%}",
+            "theoretical_price": f"{signal.theoretical_price:.1%}",
+            "edge": f"{signal.edge:.2%}",
+            "volatility": f"{signal.volatility:.1%}",
+            "implied_volatility": f"{signal.implied_vol:.1%}" if signal.implied_vol else "N/A",
+            "signal": signal.signal,
+            "confidence": f"{signal.confidence:.0%}",
+            "strategy": signal.strategy.value
+        }
+
+    def get_dashboard(self) -> Dict:
+        """获取仪表盘数据"""
+        return {
+            "status": "运行中",
+            "markets_tracked": len(self.markets),
+            "total_signals": self.stats["signals"],
+            "trades_executed": self.stats["trades"],
+            "daily_pnl": f"${self.stats['pnl']:.2f}",
+            "strategy": self.execution_engine.strategy.value,
+            "min_edge": f"{self.execution_engine.min_edge:.1%}",
+            "circuit_breaker": "正常" if not self.execution_engine.circuit_breaker else "熔断",
+            "last_update": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+
+    def get_markets_table(self) -> List[List]:
+        """获取市场表格"""
+        return [
+            [m.id, m.question[:30] + "...", f"{m.yes_price:.1%}", f"${m.liquidity:,}", f"{m.expiry_minutes}m"]
+            for m in self.markets
+        ]
+
+    def configure_strategy(self, strategy: str, min_edge: float) -> Dict:
+        """配置策略"""
+        if strategy == "Taker":
+            self.execution_engine.strategy = StrategyType.TAKER
+        elif strategy == "Market Maker":
+            self.execution_engine.strategy = StrategyType.MARKET_MAKER
+        else:
+            self.execution_engine.strategy = StrategyType.HYBRID
+
+        self.execution_engine.min_edge = min_edge
+
+        return {
+            "status": "已更新",
+            "strategy": self.execution_engine.strategy.value,
+            "min_edge": f"{min_edge:.1%}"
+        }
 
 
-# ==================== Lark API Functions ====================
+# Create bot instance
+bot = PolymarketBot()
+
+
+# ==================== Lark Integration ====================
 
 async def get_token():
-    """Get Lark tenant access token"""
+    """获取飞书 token"""
     now = time.time()
     if _cache["token"] and now < _cache["expire"]:
         return _cache["token"]
@@ -99,7 +403,7 @@ async def get_token():
 
 
 async def send_msg(open_id: str, msg: str):
-    """Send message to Lark user"""
+    """发送飞书消息"""
     token = await get_token()
     if not token:
         return False
@@ -113,405 +417,48 @@ async def send_msg(open_id: str, msg: str):
             return r.json().get("code") == 0
     except Exception as e:
         log.error(f"Send error: {e}")
-        return False
+    return False
 
-
-# ==================== Market Data Functions ====================
-
-async def get_btc_price():
-    """Get BTC price from Binance"""
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT")
-            data = r.json()
-            price = float(data.get("price", 0))
-            return f"🪙 BTC/USDT\n💰 ${price:,.2f}\n📍 Binance"
-    except:
-        return "❌ Failed to get BTC price"
-
-
-async def get_eth_price():
-    """Get ETH price from Binance"""
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get("https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT")
-            data = r.json()
-            price = float(data.get("price", 0))
-            return f"💎 ETH/USDT\n💰 ${price:,.2f}\n📍 Binance"
-    except:
-        return "❌ Failed to get ETH price"
-
-
-async def get_all_prices():
-    """Get all crypto prices"""
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            btc_r = await client.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT")
-            eth_r = await client.get("https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT")
-            sol_r = await client.get("https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT")
-            btc = btc_r.json()
-            eth = eth_r.json()
-            sol = sol_r.json()
-            return f"""📊 Crypto Prices
-
-🪙 BTC: ${float(btc['price']):,.2f}
-💎 ETH: ${float(eth['price']):,.2f}
-🌞 SOL: ${float(sol['price']):,.2f}
-
-📍 Binance | Updated: {datetime.now().strftime('%H:%M:%S')}"""
-    except:
-        return "❌ Failed to get prices"
-
-
-# ==================== Polymarket Super Bot ====================
-
-class PolymarketSuperBot:
-    """Polymarket Super Bot - Enhanced with predict-fun-marketmaker features"""
-    
-    def __init__(self):
-        self.markets: List[Market] = self._init_markets()
-        self.positions: List[Position] = []
-        self.risk_level = RiskLevel.LOW
-        self.running = True
-        self.config = {
-            "market_maker": {"enabled": False, "spread_bps": 150},
-            "arbitrage": {"enabled": False, "min_profit": 0.01},
-            "risk": {"max_position": 100, "stop_loss": 0.30}
-        }
-        self.stats = {
-            "trades": 0,
-            "pnl": 0.0,
-            "arbitrage_opportunities": 0,
-            "win_rate": 0.68
-        }
-    
-    def _init_markets(self) -> List[Market]:
-        """Initialize mock markets"""
-        return [
-            Market("btc_100k", "Will BTC reach $100k by March 2025?", 0.72, 0.28, 150000),
-            Market("eth_5k", "Will ETH exceed $5,000 by Q2 2025?", 0.45, 0.55, 80000),
-            Market("sol_200", "Will SOL break $200 in 2025?", 0.58, 0.42, 50000),
-            Market("trump_2024", "Trump wins 2024 election?", 0.52, 0.48, 200000),
-            Market("rate_cut", "Fed cuts rates in March?", 0.25, 0.75, 120000),
-            Market("btc_etf", "BTC ETF approved by SEC?", 0.85, 0.15, 300000),
-            Market("eth_etf", "ETH ETF approved in 2024?", 0.42, 0.58, 180000),
-            Market("sol_etf", "SOL ETF approved in 2025?", 0.15, 0.85, 90000),
-        ]
-    
-    def get_dashboard(self) -> Dict:
-        """Get dashboard data"""
-        return {
-            "status": "运行中" if self.running else "已停止",
-            "risk_level": self.risk_level.value,
-            "markets_tracked": len(self.markets),
-            "positions": len(self.positions),
-            "total_pnl": f"${self.stats['pnl']:.2f}",
-            "win_rate": f"{self.stats['win_rate']:.0%}",
-            "market_maker": "启用" if self.config["market_maker"]["enabled"] else "禁用",
-            "arbitrage": "启用" if self.config["arbitrage"]["enabled"] else "禁用",
-            "last_update": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
-    
-    def get_markets_table(self) -> List[List]:
-        """Get markets as table"""
-        return [
-            [m.id, m.question[:35] + "...", f"{m.yes_price:.1%}", f"${m.liquidity:,}"]
-            for m in self.markets[:6]
-        ]
-    
-    def get_arbitrage_opportunities(self) -> List[Dict]:
-        """Find arbitrage opportunities"""
-        opportunities = []
-        for m in self.markets:
-            # Simulate cross-platform arbitrage
-            if abs(m.yes_price + m.no_price - 1.0) > 0.02:
-                profit = abs(m.yes_price + m.no_price - 1.0)
-                opportunities.append({
-                    "market": m.id,
-                    "type": "站内套利",
-                    "profit": f"{profit:.2%}",
-                    "confidence": "高" if profit > 0.03 else "中"
-                })
-        return opportunities
-    
-    def get_risk_metrics(self) -> Dict:
-        """Get risk metrics"""
-        return {
-            "portfolio_value": 10000.00,
-            "unrealized_pnl": 250.50,
-            "realized_pnl": 1200.00,
-            "max_drawdown": "5.2%",
-            "win_rate": f"{self.stats['win_rate']:.0%}",
-            "sharpe_ratio": 1.85,
-            "open_positions": len(self.positions),
-            "daily_pnl": 85.30,
-            "risk_level": self.risk_level.value,
-            "circuit_breaker": "正常"
-        }
-    
-    def analyze_market(self, market_id: str) -> Dict:
-        """Analyze a market"""
-        market = next((m for m in self.markets if m.id == market_id), None)
-        if not market:
-            return {"error": "Market not found"}
-        
-        return {
-            "market": market.question,
-            "current_price": f"{market.yes_price:.1%}",
-            "liquidity": f"${market.liquidity:,}",
-            "rsi": 45.5,
-            "macd": "看涨" if market.yes_price > 0.5 else "看跌",
-            "support": f"{max(0.1, market.yes_price - 0.1):.1%}",
-            "resistance": f"{min(0.9, market.yes_price + 0.1):.1%}",
-            "trend": "上升趋势" if market.yes_price > 0.5 else "下降趋势",
-            "recommendation": "买入 YES" if market.yes_price < 0.7 else "观望"
-        }
-    
-    def execute_trade(self, market_id: str, side: str, amount: float) -> Dict:
-        """Execute a trade (simulated)"""
-        market = next((m for m in self.markets if m.id == market_id), None)
-        if not market:
-            return {"error": "Market not found"}
-        
-        self.stats["trades"] += 1
-        return {
-            "status": "成功 (模拟)",
-            "market": market.question,
-            "side": side,
-            "amount": f"${amount:.2f}",
-            "price": f"{market.yes_price:.1%}",
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "tx_id": f"tx_{int(time.time())}"
-        }
-    
-    def configure(self, component: str, **kwargs) -> Dict:
-        """Configure bot components"""
-        if component in self.config:
-            self.config[component].update(kwargs)
-        return {
-            "status": "配置已更新",
-            "component": component,
-            "config": self.config[component],
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
-    
-    def run_backtest(self, strategy: str, period: str, capital: float) -> Dict:
-        """Run backtest (simulated)"""
-        return {
-            "strategy": strategy,
-            "period": period,
-            "initial_capital": f"${capital:,.2f}",
-            "final_capital": f"${capital * 1.25:,.2f}",
-            "total_return": "+25%",
-            "total_trades": 156,
-            "win_rate": "68%",
-            "max_drawdown": "-8.5%",
-            "sharpe_ratio": 1.85
-        }
-
-
-# ==================== Black-Scholes Binary Options Pricing ====================
-
-class BlackScholesBinary:
-    """
-    Black-Scholes 二元期权定价模型
-    
-    Polymarket 的涨跌市场本质上是二元期权：
-    - 如果事件发生，支付 $1
-    - 如果事件不发生，支付 $0
-    
-    二元看涨期权定价公式：
-    C_binary = e^(-rT) * N(d2)
-    """
-    
-    def __init__(self, risk_free_rate: float = 0.05):
-        self.r = risk_free_rate
-    
-    def d2(self, S: float, K: float, T: float, sigma: float) -> float:
-        if T <= 0 or sigma <= 0:
-            return 0
-        return (math.log(S / K) + (self.r - 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
-    
-    def binary_call_price(self, S: float, K: float, T: float, sigma: float) -> float:
-        """二元看涨期权定价 (Yes/Up)"""
-        if T <= 0:
-            return 1.0 if S >= K else 0.0
-        if sigma <= 0:
-            sigma = 0.01
-        d2 = self.d2(S, K, T, sigma)
-        price = math.exp(-self.r * T) * stats.norm.cdf(d2)
-        return max(0.001, min(0.999, price))
-    
-    def binary_put_price(self, S: float, K: float, T: float, sigma: float) -> float:
-        """二元看跌期权定价 (No/Down)"""
-        if T <= 0:
-            return 1.0 if S < K else 0.0
-        d2 = self.d2(S, K, T, sigma)
-        price = math.exp(-self.r * T) * stats.norm.cdf(-d2)
-        return max(0.001, min(0.999, price))
-    
-    def implied_volatility(self, market_price: float, S: float, K: float, T: float, is_call: bool = True) -> float:
-        """从市场价格反推隐含波动率"""
-        if T <= 0:
-            return 0.0
-        
-        def price_diff(sigma):
-            if is_call:
-                model_price = self.binary_call_price(S, K, T, sigma)
-            else:
-                model_price = self.binary_put_price(S, K, T, sigma)
-            return model_price - market_price
-        
-        try:
-            p_low = price_diff(0.001)
-            p_high = price_diff(5.0)
-            if p_low * p_high > 0:
-                return 0.5
-            iv = brentq(price_diff, 0.001, 5.0, maxiter=100)
-            return iv
-        except:
-            return 0.5
-
-
-class BinaryOptionsAnalyzer:
-    """二元期权分析器"""
-    
-    def __init__(self):
-        self.bs = BlackScholesBinary()
-    
-    def analyze(self, current_price: float, target_price: float, 
-                time_to_expiry_minutes: float, market_yes_price: float,
-                volatility: float = 0.5, fee_rate: float = 0.02) -> Dict:
-        """
-        分析涨跌市场
-        
-        Args:
-            current_price: 当前资产价格 (如 BTC 当前价格)
-            target_price: 目标价格 (行权价)
-            time_to_expiry_minutes: 到期时间 (分钟)
-            market_yes_price: 市场 Yes 价格 (0-1)
-            volatility: 波动率 (年化)
-            fee_rate: 手续费率
-        """
-        # 转换时间
-        T = time_to_expiry_minutes / (60 * 24 * 365)  # 转换为年
-        
-        # 计算理论价格
-        theoretical_yes = self.bs.binary_call_price(current_price, target_price, T, volatility)
-        theoretical_no = self.bs.binary_put_price(current_price, target_price, T, volatility)
-        
-        # 计算定价偏差
-        mispricing_yes = theoretical_yes - market_yes_price
-        mispricing_no = theoretical_no - (1 - market_yes_price)
-        
-        # 计算优势 (扣除费用)
-        edge_yes = mispricing_yes - fee_rate
-        edge_no = mispricing_no - fee_rate
-        
-        # 反推隐含波动率
-        iv_yes = self.bs.implied_volatility(market_yes_price, current_price, target_price, T, True)
-        iv_no = self.bs.implied_volatility(1 - market_yes_price, current_price, target_price, T, False)
-        
-        # 计算置信度
-        confidence = min(1.0, max(0, abs(mispricing_yes) * 5))
-        
-        # 生成推荐
-        if edge_yes > 0.02:
-            recommendation = f"✅ 买入 YES (Edge: {edge_yes:.2%})"
-        elif edge_no > 0.02:
-            recommendation = f"✅ 买入 NO (Edge: {edge_no:.2%})"
-        elif edge_yes > 0:
-            recommendation = f"💡 可考虑 YES (Edge: {edge_yes:.2%})"
-        elif edge_no > 0:
-            recommendation = f"💡 可考虑 NO (Edge: {edge_no:.2%})"
-        else:
-            recommendation = "⛔ 无交易优势"
-        
-        return {
-            "current_price": current_price,
-            "target_price": target_price,
-            "time_to_expiry": f"{time_to_expiry_minutes:.1f} 分钟",
-            "market_yes_price": f"{market_yes_price:.2%}",
-            "theoretical_yes": f"{theoretical_yes:.2%}",
-            "theoretical_no": f"{theoretical_no:.2%}",
-            "mispricing_yes": f"{mispricing_yes:+.2%}",
-            "mispricing_no": f"{mispricing_no:+.2%}",
-            "edge_yes": f"{edge_yes:+.2%}",
-            "edge_no": f"{edge_no:+.2%}",
-            "implied_vol_yes": f"{iv_yes:.1%}",
-            "implied_vol_no": f"{iv_no:.1%}",
-            "used_volatility": f"{volatility:.1%}",
-            "confidence": f"{confidence:.0%}",
-            "recommendation": recommendation
-        }
-
-
-# Create instances
-bot = PolymarketSuperBot()
-bs_analyzer = BinaryOptionsAnalyzer()
-
-
-# ==================== Message Processing ====================
 
 async def process_message(text: str) -> str:
-    """Process message and return response"""
+    """处理消息"""
     t = text.lower().strip()
-    
+
     if t in ["help", "/help", "?"]:
-        return """🤖 Polymarket Super Bot Commands:
+        return """🤖 Polymarket Binary Options Bot
 
-📊 Crypto: btc, eth, crypto
-🎯 Polymarket: markets, arbitrage, risk
-📈 Trading: trade <market> <side> <amount>
-⚙️ Config: mm on/off, arb on/off
-🧪 Analysis: analyze <market>
-💡 Other: help, time, status"""
-    
+📊 Commands:
+  btc, eth, prices - Crypto prices
+  markets - List markets
+  analyze <market> - Analyze with BS model
+  signal <market> - Get trade signal
+  config <strategy> - Set strategy
+
+📈 Pricing: Black-Scholes Model
+⚡ Data: Binance Real-time
+🎯 Strategies: Maker/Taker/Hybrid"""
+
     if t == "btc":
-        return await get_btc_price()
-    
+        prices = await bot.fetch_crypto_prices()
+        btc = prices.get("BTCUSDT", 0)
+        return f"🪙 BTC/USDT\n💰 ${btc:,.2f}\n📍 Binance"
+
     if t == "eth":
-        return await get_eth_price()
-    
-    if t in ["crypto", "prices"]:
-        return await get_all_prices()
-    
+        prices = await bot.fetch_crypto_prices()
+        eth = prices.get("ETHUSDT", 0)
+        return f"💎 ETH/USDT\n💰 ${eth:,.2f}\n📍 Binance"
+
+    if t in ["prices", "crypto"]:
+        prices = await bot.fetch_crypto_prices()
+        btc = prices.get("BTCUSDT", 0)
+        eth = prices.get("ETHUSDT", 0)
+        sol = prices.get("SOLUSDT", 0)
+        return f"📊 Crypto Prices\n\n🪙 BTC: ${btc:,.2f}\n💎 ETH: ${eth:,.2f}\n🌞 SOL: ${sol:,.2f}"
+
     if t == "markets":
-        markets_info = "\n".join([
-            f"• {m.id}: {m.question[:30]}... ({m.yes_price:.0%})"
-            for m in bot.markets[:5]
-        ])
-        return f"📊 Active Markets:\n\n{markets_info}"
-    
-    if t == "arbitrage":
-        opps = bot.get_arbitrage_opportunities()
-        if not opps:
-            return "💰 No arbitrage opportunities found"
-        result = "💰 Arbitrage Opportunities:\n\n"
-        for o in opps[:3]:
-            result += f"• {o['market']}: {o['profit']} ({o['confidence']})\n"
-        return result
-    
-    if t == "risk":
-        metrics = bot.get_risk_metrics()
-        return f"""🛡️ Risk Metrics:
+        markets = "\n".join([f"• {m.id}: {m.question[:25]}... ({m.yes_price:.0%})" for m in bot.markets[:5]])
+        return f"📊 Active Markets:\n\n{markets}"
 
-💰 Portfolio: {metrics['portfolio_value']}
-📈 Unrealized PnL: {metrics['unrealized_pnl']}
-📉 Max Drawdown: {metrics['max_drawdown']}
-🎯 Win Rate: {metrics['win_rate']}
-⚠️ Risk Level: {metrics['risk_level']}"""
-    
-    if t == "status":
-        dash = bot.get_dashboard()
-        return f"""🤖 Bot Status:
-
-📊 Status: {dash['status']}
-⚠️ Risk: {dash['risk_level']}
-📈 Markets: {dash['markets_tracked']}
-💰 PnL: {dash['total_pnl']}
-🎯 Win Rate: {dash['win_rate']}"""
-    
     if t.startswith("analyze "):
         market_id = t[8:].strip()
         result = bot.analyze_market(market_id)
@@ -519,49 +466,42 @@ async def process_message(text: str) -> str:
             return f"❌ {result['error']}"
         return f"""🔬 Analysis: {result['market']}
 
-💰 Price: {result['current_price']}
-📊 RSI: {result['rsi']}
-📈 MACD: {result['macd']}
-🎯 Trend: {result['trend']}
-💡 Recommendation: {result['recommendation']}"""
-    
-    if t.startswith("trade "):
-        parts = t[6:].split()
-        if len(parts) >= 3:
-            market_id, side, amount = parts[0], parts[1].upper(), float(parts[2])
-            result = bot.execute_trade(market_id, side, amount)
-            if "error" in result:
-                return f"❌ {result['error']}"
-            return f"✅ Trade Executed\n\n📊 {result['market']}\n💱 {side} ${amount}\n💵 Price: {result['price']}"
-        return "❌ Usage: trade <market> <side> <amount>"
-    
-    if t == "mm on":
-        bot.configure("market_maker", enabled=True)
-        return "📈 做市商已启用"
-    
-    if t == "mm off":
-        bot.configure("market_maker", enabled=False)
-        return "📈 做市商已禁用"
-    
-    if t == "arb on":
-        bot.configure("arbitrage", enabled=True)
-        return "💰 套利已启用"
-    
-    if t == "arb off":
-        bot.configure("arbitrage", enabled=False)
-        return "💰 套利已禁用"
-    
+💰 Market Price: {result['market_yes_price']}
+📐 Theoretical: {result['theoretical_price']}
+📊 Edge: {result['edge']}
+📈 Volatility: {result['volatility']}
+🎯 Signal: {result['signal']}
+💪 Confidence: {result['confidence']}"""
+
+    if t.startswith("signal "):
+        market_id = t[7:].strip()
+        result = bot.analyze_market(market_id)
+        if "error" in result:
+            return f"❌ {result['error']}"
+        return f"""🎯 Trade Signal
+
+Market: {result['market']}
+Signal: {result['signal']}
+Edge: {result['edge']}
+Confidence: {result['confidence']}"""
+
+    if t == "status":
+        dash = bot.get_dashboard()
+        return f"""🤖 Bot Status
+
+📊 Markets: {dash['markets_tracked']}
+📈 Signals: {dash['total_signals']}
+💰 PnL: {dash['daily_pnl']}
+🎯 Strategy: {dash['strategy']}"""
+
     if t == "time":
         return f"🕐 UTC: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}"
-    
-    if t.startswith("echo "):
-        return text[5:]
-    
+
     return f"🤖 Received: {text}\n💡 Type 'help' for commands"
 
 
 def chat_fn(message: str, history: List):
-    """Gradio chat function"""
+    """Gradio chat"""
     if not message:
         return history
     try:
@@ -574,180 +514,120 @@ def chat_fn(message: str, history: List):
 
 # ==================== Gradio Interface ====================
 
-with gr.Blocks(title="Polymarket Super Bot", theme=gr.themes.Soft()) as demo:
-    
+with gr.Blocks(title="Polymarket Binary Options Bot", theme=gr.themes.Soft()) as demo:
+
     gr.Markdown("""
-    # 🤖 Polymarket Super Bot (Enhanced)
-    
-    整合 predict-fun-marketmaker 核心功能:
-    - 统一做市商策略 (异步对冲、双轨并行)
-    - 跨平台套利检测
-    - 增强风控系统
-    - 智能库存管理
+    # 🤖 Polymarket Binary Options Bot
+
+    基于 Black-Scholes 模型的二元期权定价系统
+
+    **核心功能:**
+    - 📐 BS 模型计算理论价格
+    - 📊 隐含波动率估算
+    - ⚡ Binance 实时数据
+    - 🎯 Maker/Taker/Hybrid 策略
     """)
-    
+
     with gr.Tabs():
-        # Tab 1: Chat
+        # Chat Tab
         with gr.TabItem("💬 Chat"):
-            chatbot = gr.Chatbot(height=400, show_label=False)
+            chatbot = gr.Chatbot(height=400)
             with gr.Row():
-                msg = gr.Textbox(placeholder="Type a command... (try 'help')", scale=4, show_label=False)
+                msg = gr.Textbox(placeholder="Type 'help' for commands...", scale=4, show_label=False)
                 btn = gr.Button("Send", variant="primary", scale=1)
-            clear = gr.Button("Clear Chat")
-            
+            clear = gr.Button("Clear")
+
             msg.submit(chat_fn, [msg, chatbot], [chatbot])
             btn.click(chat_fn, [msg, chatbot], [chatbot])
             clear.click(lambda: [], None, [chatbot])
-        
-        # Tab 2: Dashboard
+
+        # Dashboard Tab
         with gr.TabItem("📊 Dashboard"):
-            with gr.Row():
-                dashboard_json = gr.Code(label="系统状态", language="json", 
-                                        value=json.dumps(bot.get_dashboard(), indent=2, ensure_ascii=False))
-            refresh_dash = gr.Button("🔄 刷新", variant="primary")
-            
-            gr.Markdown("### 市场监控")
+            dashboard_json = gr.Code(label="系统状态", language="json",
+                                    value=json.dumps(bot.get_dashboard(), indent=2, ensure_ascii=False))
+            refresh = gr.Button("🔄 刷新", variant="primary")
+
+            gr.Markdown("### 市场列表")
             markets_df = gr.Dataframe(
-                headers=["ID", "问题", "Yes 价格", "流动性"],
-                value=bot.get_markets_table(),
-                label="活跃市场"
+                headers=["ID", "问题", "Yes 价格", "流动性", "周期"],
+                value=bot.get_markets_table()
             )
-            
-            refresh_dash.click(
+
+            refresh.click(
                 fn=lambda: json.dumps(bot.get_dashboard(), indent=2, ensure_ascii=False),
                 outputs=dashboard_json
             )
-        
-        # Tab 3: Arbitrage
-        with gr.TabItem("💰 套利"):
-            gr.Markdown("### 套利机会")
-            arb_output = gr.Code(label="套利机会", language="json",
-                                value=json.dumps(bot.get_arbitrage_opportunities(), indent=2, ensure_ascii=False))
-            scan_arb = gr.Button("🔍 扫描机会", variant="primary")
-            
-            scan_arb.click(
-                fn=lambda: json.dumps(bot.get_arbitrage_opportunities(), indent=2, ensure_ascii=False),
-                outputs=arb_output
+
+        # Pricing Tab
+        with gr.TabItem("📐 BS 定价"):
+            gr.Markdown("### Black-Scholes 二元期权定价")
+
+            with gr.Row():
+                bs_current = gr.Number(label="当前价格 (S)", value=96500)
+                bs_strike = gr.Number(label="行权价 (K)", value=97000)
+                bs_time = gr.Number(label="到期时间 (分钟)", value=15)
+                bs_vol = gr.Number(label="波动率 (%)", value=50)
+
+            bs_btn = gr.Button("计算理论价格", variant="primary")
+            bs_result = gr.Code(label="定价结果", language="json")
+
+            def calculate_bs_price(S, K, T_min, vol_pct):
+                T = T_min * 60 / (365 * 24 * 3600)
+                sigma = vol_pct / 100
+                call_price = price_binary_option(S, K, T, 0.05, sigma, True)
+                put_price = price_binary_option(S, K, T, 0.05, sigma, False)
+                return json.dumps({
+                    "call_price (UP)": f"{call_price:.2%}",
+                    "put_price (DOWN)": f"{put_price:.2%}",
+                    "sum": f"{call_price + put_price:.2%}",
+                    "parameters": {
+                        "S": f"${S:,.0f}",
+                        "K": f"${K:,.0f}",
+                        "T": f"{T_min} min",
+                        "sigma": f"{vol_pct:.0%}"
+                    }
+                }, indent=2, ensure_ascii=False)
+
+            bs_btn.click(
+                fn=calculate_bs_price,
+                inputs=[bs_current, bs_strike, bs_time, bs_vol],
+                outputs=bs_result
             )
-        
-        # Tab 4: Risk
-        with gr.TabItem("🛡️ 风控"):
-            risk_output = gr.Code(label="风险指标", language="json",
-                                 value=json.dumps(bot.get_risk_metrics(), indent=2, ensure_ascii=False))
-            refresh_risk = gr.Button("🔄 刷新风险指标", variant="primary")
-            
-            refresh_risk.click(
-                fn=lambda: json.dumps(bot.get_risk_metrics(), indent=2, ensure_ascii=False),
-                outputs=risk_output
-            )
-        
-        # Tab 5: Analysis
+
+        # Analysis Tab
         with gr.TabItem("🔬 分析"):
             analysis_market = gr.Dropdown(
                 label="选择市场",
                 choices=[m.id for m in bot.markets],
-                value="btc_100k"
+                value="btc_15m_up"
             )
             analyze_btn = gr.Button("📊 分析", variant="primary")
             analysis_result = gr.Code(label="分析结果", language="json")
-            
+
             analyze_btn.click(
                 fn=lambda m: json.dumps(bot.analyze_market(m), indent=2, ensure_ascii=False),
                 inputs=[analysis_market],
                 outputs=analysis_result
             )
-        
-        # Tab 6: Trade
-        with gr.TabItem("💱 交易"):
-            with gr.Row():
-                trade_market = gr.Dropdown(
-                    label="选择市场",
-                    choices=[m.id for m in bot.markets],
-                    value="btc_100k"
-                )
-                trade_side = gr.Radio(label="方向", choices=["BUY_YES", "BUY_NO", "SELL_YES", "SELL_NO"], value="BUY_YES")
-                trade_amount = gr.Number(label="金额 ($)", value=100)
-            
-            trade_btn = gr.Button("🚀 执行交易", variant="primary")
-            trade_result = gr.Code(label="交易结果", language="json")
-            
-            trade_btn.click(
-                fn=lambda m, s, a: json.dumps(bot.execute_trade(m, s, a), indent=2, ensure_ascii=False),
-                inputs=[trade_market, trade_side, trade_amount],
-                outputs=trade_result
+
+        # Config Tab
+        with gr.TabItem("⚙️ 配置"):
+            gr.Markdown("### 执行策略配置")
+
+            config_strategy = gr.Radio(
+                label="策略类型",
+                choices=["Taker", "Market Maker", "Hybrid"],
+                value="Hybrid"
             )
-        
-        # Tab 7: Binary Options Pricing
-        with gr.TabItem("📐 BS定价"):
-            gr.Markdown("""
-            ### Black-Scholes 二元期权定价
-            
-            Polymarket 涨跌市场本质上是二元期权。使用 BS 模型计算公允价格。
-            
-            **核心参数**:
-            - 隐含波动率 (σ): 最难估算的参数，需要研究或历史数据建模
-            - 到期时间 (T): 15分钟市场 = 0.0000285年
-            - 目标价格 (K): 行权价
-            
-            **策略**: 当理论价格与市场价格偏差足够大时 (Edge > 2%)，才有交易优势
-            """)
-            
-            with gr.Row():
-                bs_current = gr.Number(label="当前价格 (如 BTC)", value=95000)
-                bs_target = gr.Number(label="目标价格 (行权价)", value=95000)
-            with gr.Row():
-                bs_expiry = gr.Number(label="到期时间 (分钟)", value=15)
-                bs_market = gr.Number(label="市场 Yes 价格", value=0.52)
-            with gr.Row():
-                bs_vol = gr.Slider(label="波动率 (年化)", minimum=0.1, maximum=2.0, value=0.5, step=0.05)
-                bs_fee = gr.Slider(label="手续费率", minimum=0.01, maximum=0.05, value=0.02, step=0.005)
-            
-            bs_btn = gr.Button("📊 计算公允价格", variant="primary")
-            bs_result = gr.Code(label="定价分析", language="json")
-            
-            bs_btn.click(
-                fn=lambda c, t, e, m, v, f: json.dumps(
-                    bs_analyzer.analyze(c, t, e, m, v, f), 
-                    indent=2, ensure_ascii=False
-                ),
-                inputs=[bs_current, bs_target, bs_expiry, bs_market, bs_vol, bs_fee],
-                outputs=bs_result
-            )
-            
-            gr.Markdown("""
-            ---
-            **⚠️ 风险提示**:
-            - 波动率估算是最关键的参数
-            - 临近到期时不要购买高价期权
-            - 简单延迟套利难以规模化盈利
-            """)
-        
-        # Tab 8: Config
-        with gr.TabItem("⚙️ 配置"): 
-            gr.Markdown("### 做市商配置")
-            with gr.Row():
-                mm_enabled = gr.Checkbox(label="启用做市商", value=False)
-                mm_spread = gr.Slider(label="价差 (基点)", minimum=50, maximum=500, value=150, step=10)
-            mm_btn = gr.Button("💾 保存做市商配置", variant="primary")
-            mm_result = gr.Code(label="结果", language="json")
-            
-            mm_btn.click(
-                fn=lambda e, s: json.dumps(bot.configure("market_maker", enabled=e, spread_bps=s), indent=2, ensure_ascii=False),
-                inputs=[mm_enabled, mm_spread],
-                outputs=mm_result
-            )
-            
-            gr.Markdown("### 套利配置")
-            with gr.Row():
-                arb_enabled = gr.Checkbox(label="启用套利", value=False)
-                arb_min_profit = gr.Slider(label="最小利润 (%)", minimum=0.5, maximum=5, value=1, step=0.5)
-            arb_btn = gr.Button("💾 保存套利配置", variant="primary")
-            arb_result = gr.Code(label="结果", language="json")
-            
-            arb_btn.click(
-                fn=lambda e, p: json.dumps(bot.configure("arbitrage", enabled=e, min_profit=p/100), indent=2, ensure_ascii=False),
-                inputs=[arb_enabled, arb_min_profit],
-                outputs=arb_result
+            config_edge = gr.Slider(label="最小边际 (%)", minimum=0.5, maximum=5, value=2, step=0.5)
+
+            config_btn = gr.Button("💾 保存配置", variant="primary")
+            config_result = gr.Code(label="配置结果", language="json")
+
+            config_btn.click(
+                fn=lambda s, e: json.dumps(bot.configure_strategy(s, e/100), indent=2, ensure_ascii=False),
+                inputs=[config_strategy, config_edge],
+                outputs=config_result
             )
 
 
@@ -757,7 +637,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
-app = FastAPI(title="Polymarket Super Bot")
+app = FastAPI(title="Polymarket Binary Options Bot")
 
 app.add_middleware(
     CORSMiddleware,
@@ -766,14 +646,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-log.info("🚀 Polymarket Super Bot Started")
+log.info("Polymarket Binary Options Bot Started")
 
 
 @app.middleware("http")
 async def webhook_middleware(request: Request, call_next):
-    if request.url.path == "/webhook":
-        return await handle_webhook(request)
-    if request.url.path == "/api":
+    if request.url.path in ["/webhook", "/api"]:
         return await handle_webhook(request)
     return await call_next(request)
 
@@ -781,39 +659,37 @@ async def webhook_middleware(request: Request, call_next):
 async def handle_webhook(request: Request) -> Response:
     if request.method == "GET":
         return Response(content=json.dumps({"status": "ok"}), media_type="application/json")
-    
+
     try:
         body = await request.json()
         log.info(f"Webhook: {body.get('type', 'unknown')}")
-        
-        # URL verification
+
         if body.get("type") == "url_verification":
             return Response(
                 content=json.dumps({"challenge": body.get("challenge", "")}),
                 media_type="application/json"
             )
-        
-        # Message event
+
         if body.get("header", {}).get("event_type") == "im.message.receive_v1":
             event = body.get("event", {})
             message = event.get("message", {})
             sender = event.get("sender", {}).get("sender_id", {})
-            
+
             if message.get("message_type") == "text":
                 try:
                     content = json.loads(message.get("content", "{}"))
                     text = content.get("text", "")
                 except:
                     text = message.get("content", "")
-                
+
                 open_id = sender.get("open_id", "")
-                
+
                 if text and open_id:
                     response = await process_message(text)
                     await send_msg(open_id, response)
-        
+
         return Response(content=json.dumps({"code": 0}), media_type="application/json")
-    
+
     except Exception as e:
         log.error(f"Webhook error: {e}")
         return Response(content=json.dumps({"code": -1, "error": str(e)}), media_type="application/json")
@@ -821,12 +697,7 @@ async def handle_webhook(request: Request) -> Response:
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "bot": "polymarket-super-bot"}
-
-
-@app.get("/api/status")
-async def api_status():
-    return bot.get_dashboard()
+    return {"status": "ok", "bot": "polymarket-binary-options"}
 
 
 app = gr.mount_gradio_app(app, demo, path="/")
