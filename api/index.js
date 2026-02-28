@@ -1,8 +1,28 @@
-// 飞书机器人 Webhook - AI 增强版
-const HF_SPACE_URL = process.env.HF_SPACE_URL || 'https://stanley2000008love-multi-agent-lark-bot.hf.space';
+// 飞书机器人 - AI 超级智能版 (NVIDIA NIM API)
 const LARK_APP_ID = process.env.LARK_APP_ID || 'cli_a9f678dd01b8de1b';
 const LARK_APP_SECRET = process.env.LARK_APP_SECRET || '4NJnbgKT1cGjc8ddKhrjNcrEgsCT368K';
 const LARK_API = 'https://open.larksuite.com/open-apis';
+
+// NVIDIA NIM API
+const NVIDIA_API_KEY = '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';
+const NVIDIA_API = 'https://integrate.api.nvidia.com/v1/chat/completions';
+
+// 可用的顶级模型
+const AI_MODELS = {
+  // 超大模型
+  'llama-405b': 'meta/llama-3.1-405b-instruct',
+  'deepseek-v3': 'deepseek-ai/deepseek-v3.1',
+  'mistral-large': 'mistralai/mistral-large-3-675b-instruct-2512',
+  'qwen3': 'qwen/qwen3-235b-a22b',
+  
+  // 快速响应模型
+  'llama-70b': 'meta/llama-3.1-70b-instruct',
+  'llama-33-70b': 'meta/llama-3.3-70b-instruct',
+  'kimi': 'moonshotai/kimi-k2-instruct',
+  
+  // 默认模型 (平衡速度和质量)
+  'default': 'meta/llama-3.1-70b-instruct'
+};
 
 let tokenCache = { token: null, expire: 0 };
 
@@ -40,7 +60,7 @@ async function sendLarkMessage(openId, message) {
   } catch (e) { return false; }
 }
 
-// 回复消息 (群聊使用)
+// 回复群消息
 async function replyLarkMessage(messageId, message) {
   const token = await getLarkToken();
   if (!token) return false;
@@ -70,68 +90,101 @@ async function sendToGroup(chatId, message) {
   } catch (e) { return false; }
 }
 
+// ============== NVIDIA NIM AI 对话 ==============
+
+// 调用 NVIDIA NIM API
+async function chatWithNVIDIA(message, model = 'default', systemPrompt = null) {
+  const modelId = AI_MODELS[model] || AI_MODELS.default;
+  
+  const system = systemPrompt || `你是AI Agent，一个专业的加密货币和区块链助手。
+
+你的能力:
+- 实时加密货币价格查询和分析
+- 区块链技术解释
+- Polymarket 预测市场分析
+- 投资建议和风险管理
+- 市场趋势分析
+
+回复风格:
+- 简洁专业
+- 使用表情符号增加可读性
+- 提供有价值的信息
+- 对投资问题提醒风险`;
+
+  try {
+    const res = await fetch(NVIDIA_API, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${NVIDIA_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: modelId,
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user', content: message }
+        ],
+        temperature: 0.7,
+        max_tokens: 1024
+      })
+    });
+    
+    if (res.ok) {
+      const data = await res.json();
+      return data.choices?.[0]?.message?.content || null;
+    } else {
+      console.error('NVIDIA API error:', res.status);
+    }
+  } catch (e) {
+    console.error('AI 对话失败:', e);
+  }
+  return null;
+}
+
+// 使用大模型深度分析
+async function deepAnalysis(message) {
+  return await chatWithNVIDIA(message, 'llama-70b');
+}
+
 // ============== 加密货币数据 ==============
 
-// 多数据源获取 BTC 价格
 async function getBtcPrice() {
-  const sources = [
-    { name: 'Binance', url: 'https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT', parse: (d) => d.price },
-    { name: 'CoinGecko', url: 'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd', parse: (d) => d.bitcoin?.usd },
-  ];
-  
-  for (const source of sources) {
-    try {
-      const res = await fetch(source.url, { timeout: 5000 });
-      const data = await res.json();
-      const price = source.parse(data);
-      if (price) {
-        const formatted = parseFloat(price).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-        return `🪙 BTC/USDT\n💰 $${formatted}\n📍 ${source.name}\n⏰ ${new Date().toLocaleTimeString()}`;
-      }
-    } catch (e) {
-      console.error(`${source.name} 失败:`, e.message);
-    }
+  try {
+    const res = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT', { timeout: 5000 });
+    const data = await res.json();
+    const price = parseFloat(data.price).toLocaleString('en-US', { minimumFractionDigits: 2 });
+    return `🪙 BTC/USDT\n💰 $${price}\n📍 Binance\n⏰ ${new Date().toLocaleTimeString()}`;
+  } catch (e) {
+    return '❌ 获取 BTC 价格失败，请稍后重试';
   }
-  return '❌ 无法获取 BTC 价格，请稍后重试';
 }
 
-// 多数据源获取 ETH 价格
 async function getEthPrice() {
-  const sources = [
-    { name: 'Binance', url: 'https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT', parse: (d) => d.price },
-    { name: 'CoinGecko', url: 'https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd', parse: (d) => d.ethereum?.usd },
-  ];
-  
-  for (const source of sources) {
-    try {
-      const res = await fetch(source.url, { timeout: 5000 });
-      const data = await res.json();
-      const price = source.parse(data);
-      if (price) {
-        const formatted = parseFloat(price).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-        return `💎 ETH/USDT\n💰 $${formatted}\n📍 ${source.name}\n⏰ ${new Date().toLocaleTimeString()}`;
-      }
-    } catch (e) {
-      console.error(`${source.name} 失败:`, e.message);
-    }
+  try {
+    const res = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT', { timeout: 5000 });
+    const data = await res.json();
+    const price = parseFloat(data.price).toLocaleString('en-US', { minimumFractionDigits: 2 });
+    return `💎 ETH/USDT\n💰 $${price}\n📍 Binance\n⏰ ${new Date().toLocaleTimeString()}`;
+  } catch (e) {
+    return '❌ 获取 ETH 价格失败，请稍后重试';
   }
-  return '❌ 无法获取 ETH 价格，请稍后重试';
 }
 
-// 获取所有主流币价格
 async function getAllCryptoPrices() {
   try {
-    const res = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana,cardano,ripple&vs_currencies=usd&include_24hr_change=true', { timeout: 8000 });
+    const res = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana,cardano,ripple,chainlink,dogecoin&vs_currencies=usd&include_24hr_change=true', { timeout: 8000 });
     const data = await res.json();
     
     let msg = '📊 加密货币实时行情\n\n';
     
     const coins = [
-      { id: 'bitcoin', symbol: '🪙 BTC', name: 'Bitcoin' },
-      { id: 'ethereum', symbol: '💎 ETH', name: 'Ethereum' },
-      { id: 'solana', symbol: '☀️ SOL', name: 'Solana' },
-      { id: 'cardano', symbol: '🔷 ADA', name: 'Cardano' },
-      { id: 'ripple', symbol: '💧 XRP', name: 'Ripple' },
+      { id: 'bitcoin', symbol: '🪙 BTC' },
+      { id: 'ethereum', symbol: '💎 ETH' },
+      { id: 'solana', symbol: '☀️ SOL' },
+      { id: 'chainlink', symbol: '🔗 LINK' },
+      { id: 'ripple', symbol: '💧 XRP' },
+      { id: 'cardano', symbol: '🔷 ADA' },
+      { id: 'dogecoin', symbol: '🐕 DOGE' },
     ];
     
     for (const coin of coins) {
@@ -143,102 +196,35 @@ async function getAllCryptoPrices() {
       }
     }
     
-    msg += `\n⏰ ${new Date().toLocaleTimeString()}\n📍 CoinGecko`;
+    msg += `\n⏰ ${new Date().toLocaleTimeString()}`;
     return msg;
   } catch (e) {
-    return '❌ 无法获取价格数据，请稍后重试';
+    return '❌ 无法获取价格数据';
   }
 }
 
-// ============== Polymarket 数据 ==============
-
-// 获取 Polymarket BTC 15m 市场
-async function getPolymarketBT15m() {
-  try {
-    const res = await fetch('https://clob.polymarket.com/events?active=true&limit=5', { timeout: 10000 });
-    const data = await res.json();
-    
-    if (data && data.length > 0) {
-      let msg = '🎯 Polymarket 热门市场\n\n';
-      
-      for (let i = 0; i < Math.min(3, data.length); i++) {
-        const event = data[i];
-        const title = event.title || event.question || 'Unknown';
-        msg += `${i + 1}. ${title.substring(0, 50)}${title.length > 50 ? '...' : ''}\n`;
-      }
-      
-      msg += '\n🔗 polymarket.com\n💡 输入 "市场详情" 查看更多';
-      return msg;
-    }
-  } catch (e) {
-    console.error('Polymarket API 失败:', e);
-  }
-  
-  return `🎯 Polymarket 预测市场
-
-📈 BTC Up or Down 15分钟市场
-预测 BTC 在接下来15分钟内上涨还是下跌
-
-🔗 polymarket.com 参与交易
-⚠️ 预测市场有风险，请谨慎参与`;
-}
-
-// ============== AI 对话功能 ==============
-
-// 调用 AI 进行智能对话
-async function chatWithAI(userMessage) {
-  try {
-    const res = await fetch('https://api.dify.ai/v1/chat-messages', {
-      method: 'POST',
-      headers: {
-        'Authorization': 'Bearer app-xxx', // 需要配置 Dify API Key
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        inputs: {},
-        query: userMessage,
-        user: 'lark-user',
-        response_mode: 'blocking'
-      })
-    });
-    
-    if (res.ok) {
-      const data = await res.json();
-      return data.answer || null;
-    }
-  } catch (e) {
-    console.error('AI 对话失败:', e);
-  }
-  return null;
-}
-
-// ============== 市场分析 ==============
-
-// 获取市场概览
 async function getMarketOverview() {
   try {
     const res = await fetch('https://api.coingecko.com/api/v3/global', { timeout: 8000 });
     const data = await res.json();
     
     if (data.data) {
-      const btcDominance = data.data.market_cap_percentage?.btc?.toFixed(1);
-      const ethDominance = data.data.market_cap_percentage?.eth?.toFixed(1);
+      const btcDom = data.data.market_cap_percentage?.btc?.toFixed(1);
+      const ethDom = data.data.market_cap_percentage?.eth?.toFixed(1);
       const totalMcap = (data.data.total_market_cap?.usd / 1e12)?.toFixed(2);
-      const change24h = data.data.market_cap_change_percentage_24h_usd?.toFixed(2);
+      const change = data.data.market_cap_change_percentage_24h_usd?.toFixed(2);
       
       return `🌍 市场概览
 
 💰 总市值: $${totalMcap}T
-📊 24h 变化: ${change24h > 0 ? '📈' : '📉'} ${change24h}%
+📊 24h: ${change > 0 ? '📈' : '📉'} ${change}%
 
-👑 BTC 占比: ${btcDominance}%
-💎 ETH 占比: ${ethDominance}%
+👑 BTC: ${btcDom}%
+💎 ETH: ${ethDom}%
 
 ⏰ ${new Date().toLocaleTimeString()}`;
     }
-  } catch (e) {
-    console.error('市场概览获取失败:', e);
-  }
+  } catch (e) {}
   return '❌ 无法获取市场数据';
 }
 
@@ -249,103 +235,73 @@ async function processMessage(text) {
   
   // 帮助
   if (t === 'help' || t === '/help' || t === '?' || t === '帮助' || t === '菜单') {
-    return `🤖 AI Agent 智能助手
+    return `🤖 AI Agent 超级智能助手
 
-📊 加密货币行情:
+📊 行情查询:
   btc - 比特币价格
   eth - 以太坊价格
   crypto - 主流币行情
   market - 市场概览
 
 🎯 Polymarket:
-  polymarket - 热门市场
-  btc15m - BTC 15分钟市场
+  polymarket - 预测市场
 
-💡 智能对话:
-  直接发送任何问题
-  我会尝试回答你
+💡 AI 对话 (任意问题):
+  例如: "BTC后市怎么看？"
+  "什么是DeFi？"
+  "分析一下当前市场"
 
 📝 其他:
-  time - 当前时间
-  help - 显示帮助`;
+  time - 时间
+  help - 帮助`;
   }
   
-  // BTC 价格
+  // 价格查询
   if (t === 'btc' || t === '比特币' || t === 'bitcoin') {
     return await getBtcPrice();
   }
-  
-  // ETH 价格
   if (t === 'eth' || t === '以太坊' || t === 'ethereum') {
     return await getEthPrice();
   }
-  
-  // 所有加密货币
-  if (t === 'crypto' || t === '行情' || t === '币价' || t === '价格') {
+  if (t === 'crypto' || t === '行情' || t === '币价') {
     return await getAllCryptoPrices();
   }
-  
-  // 市场概览
-  if (t === 'market' || t === '市场' || t === '概览') {
+  if (t === 'market' || t === '市场') {
     return await getMarketOverview();
   }
   
   // Polymarket
-  if (t === 'polymarket' || t.includes('预测') || t === '市场详情') {
-    return await getPolymarketBT15m();
-  }
-  
-  // BTC 15m
-  if (t === 'btc15m' || t.includes('15分钟') || t.includes('15m')) {
-    return `⏱️ BTC 15分钟预测市场
+  if (t === 'polymarket' || t.includes('预测市场')) {
+    return `🎯 Polymarket 预测市场
 
-📊 在 Polymarket 上:
-预测 BTC 在接下来15分钟内
-上涨 ⬆️ 还是下跌 ⬇️
+📈 BTC Up or Down 15分钟
+预测 BTC 15分钟内涨跌
 
-🔗 polymarket.com 参与
-⚠️ 高风险预测市场，请谨慎参与
+🔗 polymarket.com
 
-💡 提示: 这是一种短期投机工具
-建议结合技术分析使用`;
+💡 问我关于预测市场的问题
+例如: "如何分析预测市场？"`;
   }
   
   // 时间
   if (t === 'time' || t === '时间') {
     const now = new Date();
-    const utc = now.toISOString().replace('T', ' ').substring(0, 19);
-    const beijing = new Date(now.getTime() + 8*3600000).toISOString().replace('T', ' ').substring(0, 19);
-    const ny = new Date(now.getTime() - 5*3600000).toISOString().replace('T', ' ').substring(0, 19);
-    return `🕐 时区时间
-
-🌍 UTC: ${utc}
-🇨🇳 北京: ${beijing}
-🇺🇸 纽约: ${ny}`;
+    return `🕐 ${now.toISOString().replace('T', ' ').substring(0, 19)} UTC`;
   }
   
-  // Echo 测试
-  if (t.startsWith('echo ')) {
-    return text.substring(5);
-  }
-  
-  // 默认：尝试智能回复
-  const aiReply = await chatWithAI(text);
+  // 默认：AI 智能回复
+  const aiReply = await chatWithNVIDIA(text);
   if (aiReply) {
     return aiReply;
   }
   
-  // 如果 AI 不可用，返回默认回复
-  return `🤖 收到: "${text}"
+  return `🤖 AI 暂时无法响应
 
-我理解你想了解 "${text}"
-
-💡 试试以下命令:
-  btc - 查看比特币价格
-  eth - 查看以太坊价格
-  crypto - 查看所有行情
-  polymarket - 预测市场
-  
-或直接问我问题！`;
+💡 试试这些命令:
+  btc - BTC价格
+  eth - ETH价格  
+  crypto - 所有行情
+  help - 帮助`;
 }
 
 // ============== 主处理函数 ==============
@@ -362,9 +318,10 @@ export default async function handler(req, res) {
   if (req.method === 'GET') {
     return res.status(200).json({ 
       status: 'ok', 
-      service: 'lark-ai-agent',
-      version: '3.0.0',
-      features: ['crypto', 'polymarket', 'ai-chat']
+      service: 'lark-ai-super-agent',
+      version: '4.0.0',
+      ai: 'NVIDIA NIM - Llama 3.1 70B',
+      models: Object.keys(AI_MODELS)
     });
   }
   
@@ -372,8 +329,6 @@ export default async function handler(req, res) {
   if (typeof body === 'string') {
     try { body = JSON.parse(body); } catch (e) {}
   }
-  
-  console.log('收到请求:', JSON.stringify(body).substring(0, 500));
   
   // URL验证
   if (body && body.type === 'url_verification') {
@@ -410,7 +365,7 @@ export default async function handler(req, res) {
         text = text.trim();
         
         if (text) {
-          console.log(`处理消息: "${text}" (${chatType})`);
+          console.log(`消息: "${text}" (${chatType})`);
           
           const reply = await processMessage(text);
           
