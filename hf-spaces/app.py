@@ -32,6 +32,7 @@ APP_SECRET = os.getenv("LARK_APP_SECRET", "4NJnbgKT1cGjc8ddKhrjNcrEgsCT368K")
 API = "https://open.larksuite.com/open-apis"
 
 _cache = {"token": None, "expire": 0}
+_price_cache = {"data": None, "time": 0}
 
 
 # ==================== Bot State ====================
@@ -79,7 +80,7 @@ def norm_pdf(x): return math.exp(-0.5 * x ** 2) / math.sqrt(2 * math.pi)
 
 
 def price_binary_option(S, K, T, r=0.05, sigma=0.5, is_call=True):
-    if T <= 0 or sigma <= 0: return 0.5
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0: return 0.5
     sqrt_T = math.sqrt(T)
     d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * sqrt_T)
     d2 = d1 - sigma * sqrt_T
@@ -87,9 +88,101 @@ def price_binary_option(S, K, T, r=0.05, sigma=0.5, is_call=True):
     return max(0.0, min(1.0, price))
 
 
+# ==================== Real-time Prices ====================
+
+async def get_prices():
+    """获取实时价格 - 从 Binance API"""
+    # 使用缓存 (5秒有效期)
+    now = time.time()
+    if _price_cache["data"] and now - _price_cache["time"] < 5:
+        return _price_cache["data"]
+    
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            # 并行获取多个币种价格
+            urls = [
+                "https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT",
+                "https://api.binance.com/api/v3/ticker/24hr?symbol=ETHUSDT",
+                "https://api.binance.com/api/v3/ticker/24hr?symbol=SOLUSDT",
+            ]
+            
+            responses = await asyncio.gather(
+                *[client.get(url) for url in urls],
+                return_exceptions=True
+            )
+            
+            result = {}
+            
+            # BTC
+            if not isinstance(responses[0], Exception):
+                try:
+                    data = responses[0].json()
+                    result["btc"] = float(data.get("lastPrice", 0))
+                    result["btc_change"] = float(data.get("priceChangePercent", 0))
+                except:
+                    pass
+            
+            # ETH
+            if not isinstance(responses[1], Exception):
+                try:
+                    data = responses[1].json()
+                    result["eth"] = float(data.get("lastPrice", 0))
+                    result["eth_change"] = float(data.get("priceChangePercent", 0))
+                except:
+                    pass
+            
+            # SOL
+            if not isinstance(responses[2], Exception):
+                try:
+                    data = responses[2].json()
+                    result["sol"] = float(data.get("lastPrice", 0))
+                    result["sol_change"] = float(data.get("priceChangePercent", 0))
+                except:
+                    pass
+            
+            # 验证数据
+            if result.get("btc", 0) > 0 and result.get("eth", 0) > 0:
+                _price_cache["data"] = result
+                _price_cache["time"] = now
+                return result
+            
+    except Exception as e:
+        log.error(f"Price fetch error: {e}")
+    
+    # 如果有缓存，使用缓存（即使过期）
+    if _price_cache["data"]:
+        return _price_cache["data"]
+    
+    # 返回错误标识
+    return {"error": "无法获取实时价格", "btc": 0, "eth": 0}
+
+
+async def get_prices_with_retry(max_retries=3):
+    """带重试的价格获取"""
+    for i in range(max_retries):
+        prices = await get_prices()
+        if prices.get("btc", 0) > 0:
+            return prices
+        await asyncio.sleep(0.5)
+    return prices
+
+
 # ==================== Lark Cards ====================
 
 def create_main_dashboard_card(prices):
+    # 检查是否有错误
+    if prices.get("error"):
+        price_text_btc = f"❌ {prices['error']}"
+        price_text_eth = ""
+    else:
+        btc_price = prices.get("btc", 0)
+        eth_price = prices.get("eth", 0)
+        btc_change = prices.get("btc_change", 0)
+        eth_change = prices.get("eth_change", 0)
+        
+        price_text_btc = f"**🪙 BTC/USDT**\n${btc_price:,.2f}\n{btc_change:+.2f}%"
+        price_text_eth = f"**💎 ETH/USDT**\n${eth_price:,.2f}\n{eth_change:+.2f}%"
+    
     return {
         "config": {"wide_screen_mode": True},
         "header": {
@@ -101,8 +194,8 @@ def create_main_dashboard_card(prices):
             {
                 "tag": "div",
                 "fields": [
-                    {"is_short": True, "text": {"tag": "lark_md", "content": f"**🪙 BTC/USDT**\n${prices.get('btc', 96500):,.0f}\n{prices.get('btc_change', 0):+.1f}%"}},
-                    {"is_short": True, "text": {"tag": "lark_md", "content": f"**💎 ETH/USDT**\n${prices.get('eth', 2700):,.0f}\n{prices.get('eth_change', 0):+.1f}%"}}
+                    {"is_short": True, "text": {"tag": "lark_md", "content": price_text_btc}},
+                    {"is_short": True, "text": {"tag": "lark_md", "content": price_text_eth}}
                 ]
             },
             {"tag": "hr"},
@@ -119,8 +212,8 @@ def create_main_dashboard_card(prices):
             {
                 "tag": "div",
                 "fields": [
-                    {"is_short": True, "text": {"tag": "lark_md", "content": f"**📈 做市商**\n{'✅ 启用' if bot_state.market_maker_enabled else '⏸️ 禁用'}"}},
-                    {"is_short": True, "text": {"tag": "lark_md", "content": f"**💰 套利**\n{'✅ 启用' if bot_state.arbitrage_enabled else '⏸️ 禁用'}"}}
+                    {"is_short": True, "text": {"tag": "lark_md", "content": f"**📈 做市商**\n{'✅ 启用' if bot_state.market_maker_enabled else '⏸️ 禁用'}\n价差: {bot_state.spread_bps}bps"}},
+                    {"is_short": True, "text": {"tag": "lark_md", "content": f"**💰 套利**\n{'✅ 启用' if bot_state.arbitrage_enabled else '⏸️ 禁用'}\n最小利润: {bot_state.min_profit:.1%}"}}
                 ]
             },
             {"tag": "hr"},
@@ -139,12 +232,17 @@ def create_main_dashboard_card(prices):
                     {"tag": "button", "text": {"tag": "plain_text", "content": "▶️ 启动套利" if not bot_state.arbitrage_enabled else "⏸️ 停止套利"}, "type": "primary" if not bot_state.arbitrage_enabled else "danger", "value": {"action": "toggle_arb"}}
                 ]
             },
-            {"tag": "note", "elements": [{"tag": "plain_text", "content": f"⏰ {datetime.now().strftime('%H:%M:%S')} | 策略: {bot_state.strategy.upper()}"}]}
+            {"tag": "note", "elements": [{"tag": "plain_text", "content": f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | 策略: {bot_state.strategy.upper()} | 数据源: Binance"}]}
         ]
     }
 
 
-def create_pricing_card(data):
+def create_pricing_card(data, prices):
+    # 使用实时价格
+    current_price = prices.get("btc", 0) if prices else 0
+    if current_price <= 0:
+        current_price = data.get("current_price", 0)
+    
     return {
         "config": {"wide_screen_mode": True},
         "header": {
@@ -157,8 +255,8 @@ def create_pricing_card(data):
             {
                 "tag": "div",
                 "fields": [
-                    {"is_short": True, "text": {"tag": "lark_md", "content": f"**💰 当前价格**\n${data['current_price']:,.0f}"}},
-                    {"is_short": True, "text": {"tag": "lark_md", "content": f"**🎯 行权价**\n${data['strike_price']:,.0f}"}},
+                    {"is_short": True, "text": {"tag": "lark_md", "content": f"**💰 当前价格**\n${current_price:,.2f}"}},
+                    {"is_short": True, "text": {"tag": "lark_md", "content": f"**🎯 行权价**\n${data['strike_price']:,.2f}"}},
                     {"is_short": True, "text": {"tag": "lark_md", "content": f"**📊 市场**\n{data['market_price']:.1%}"}},
                     {"is_short": True, "text": {"tag": "lark_md", "content": f"**📐 理论**\n{data['theoretical_price']:.1%}"}}
                 ]
@@ -276,35 +374,59 @@ async def send_text(open_id: str, text: str):
     return False
 
 
-async def get_prices():
-    try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            btc = await client.get("https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT")
-            eth = await client.get("https://api.binance.com/api/v3/ticker/24hr?symbol=ETHUSDT")
-            btc_data = btc.json()
-            eth_data = eth.json()
-            return {
-                "btc": float(btc_data.get("lastPrice", 96500)),
-                "eth": float(eth_data.get("lastPrice", 2700)),
-                "btc_change": float(btc_data.get("priceChangePercent", 0)),
-                "eth_change": float(eth_data.get("priceChangePercent", 0))
-            }
-    except:
-        return {"btc": 96500, "eth": 2700, "btc_change": 2.5, "eth_change": 1.8}
-
-
-def analyze_pricing():
+def analyze_pricing(current_price: float = 0):
+    """分析定价 - 使用实时价格"""
+    # 如果没有提供价格，使用默认比例
+    if current_price <= 0:
+        # 返回等待状态
+        return {
+            "market": "等待价格数据...",
+            "current_price": 0,
+            "strike_price": 0,
+            "market_price": 0.5,
+            "theoretical_price": 0.5,
+            "volatility": 0.5,
+            "edge": 0,
+            "signal": "HOLD",
+            "confidence": 0,
+            "recommendation": "等待实时价格数据"
+        }
+    
+    # 行权价 = 当前价格 * 1.005 (模拟 15 分钟涨跌预测)
+    strike_price = current_price * 1.005
+    
+    # 计算理论价格
+    T = 15 * 60 / (365 * 24 * 3600)  # 15分钟转年
+    theoretical_price = price_binary_option(current_price, strike_price, T, 0.05, 0.45)
+    
+    # 模拟市场价格 (实际应从 Polymarket 获取)
+    market_price = 0.48
+    
+    # 计算边际
+    edge = theoretical_price - market_price
+    
+    # 生成信号
+    if edge > 0.02:
+        signal = "BUY_YES"
+        recommendation = f"建议买入 YES，边际 +{edge:.1%}，超过 2% 阈值"
+    elif edge < -0.02:
+        signal = "BUY_NO"
+        recommendation = f"建议买入 NO，边际 {edge:.1%}"
+    else:
+        signal = "HOLD"
+        recommendation = "边际不足，建议观望"
+    
     return {
-        "market": "BTC up in 15 min?",
-        "current_price": 96500,
-        "strike_price": 97000,
-        "market_price": 0.48,
-        "theoretical_price": price_binary_option(96500, 97000, 15*60/(365*24*3600)),
+        "market": "BTC 15分钟内上涨?",
+        "current_price": current_price,
+        "strike_price": strike_price,
+        "market_price": market_price,
+        "theoretical_price": theoretical_price,
         "volatility": 0.45,
-        "edge": 0.043,
-        "signal": "BUY_YES",
-        "confidence": 0.85,
-        "recommendation": "建议买入 YES，边际 +4.3%"
+        "edge": edge,
+        "signal": signal,
+        "confidence": min(1.0, abs(edge) * 20),
+        "recommendation": recommendation
     }
 
 
@@ -327,17 +449,18 @@ async def process_message(text: str, open_id: str = ""):
   strategy <taker/maker/hybrid>
 
 📊 **查询:**
-  btc, eth - 价格
+  btc, eth - 实时价格
   status - 状态"""
 
     if t == "panel":
-        prices = await get_prices()
+        prices = await get_prices_with_retry()
         await send_card(open_id, create_main_dashboard_card(prices))
         return None
 
     if t == "pricing":
-        data = analyze_pricing()
-        await send_card(open_id, create_pricing_card(data))
+        prices = await get_prices_with_retry()
+        data = analyze_pricing(prices.get("btc", 0))
+        await send_card(open_id, create_pricing_card(data, prices))
         return None
 
     if t == "config":
@@ -367,14 +490,22 @@ async def process_message(text: str, open_id: str = ""):
             return f"✅ 策略已切换: {s.upper()}"
 
     if t == "btc":
-        prices = await get_prices()
-        return f"🪙 BTC/USDT\n💰 ${prices['btc']:,.0f}\n{prices['btc_change']:+.1f}%"
+        prices = await get_prices_with_retry()
+        if prices.get("error"):
+            return f"❌ {prices['error']}"
+        return f"🪙 BTC/USDT\n💰 ${prices['btc']:,.2f}\n{prices['btc_change']:+.2f}%\n📍 Binance\n⏰ {datetime.now().strftime('%H:%M:%S')}"
 
     if t == "eth":
-        prices = await get_prices()
-        return f"💎 ETH/USDT\n💰 ${prices['eth']:,.0f}\n{prices['eth_change']:+.1f}%"
+        prices = await get_prices_with_retry()
+        if prices.get("error"):
+            return f"❌ {prices['error']}"
+        return f"💎 ETH/USDT\n💰 ${prices['eth']:,.2f}\n{prices['eth_change']:+.2f}%\n📍 Binance\n⏰ {datetime.now().strftime('%H:%M:%S')}"
 
     if t == "status":
+        prices = await get_prices()
+        btc_price = prices.get('btc', 0)
+        price_info = f"${btc_price:,.2f}" if btc_price > 0 else "获取中..."
+        
         return f"""🤖 Bot 状态
 
 📊 状态: {'✅ 运行中' if bot_state.status == 'running' else '⏸️ 已暂停'}
@@ -382,7 +513,8 @@ async def process_message(text: str, open_id: str = ""):
 📈 做市商: {'✅' if bot_state.market_maker_enabled else '⏸️'}
 💰 套利: {'✅' if bot_state.arbitrage_enabled else '⏸️'}
 📊 信号: {bot_state.signals}
-💰 盈亏: ${bot_state.pnl:+.2f}"""
+💰 盈亏: ${bot_state.pnl:+.2f}
+🪙 BTC: {price_info}"""
 
     return f"🤖 收到: {text}\n💡 输入 'panel' 打开控制面板"
 
@@ -451,23 +583,22 @@ async def handle_webhook(request: Request) -> Response:
             action = body.get("action", {}).get("value", {}).get("action", "")
             open_id = body.get("open_id", "")
 
+            prices = await get_prices_with_retry()
+
             if action == "main":
-                prices = await get_prices()
                 card = create_main_dashboard_card(prices)
             elif action == "pricing":
-                card = create_pricing_card(analyze_pricing())
+                data = analyze_pricing(prices.get("btc", 0))
+                card = create_pricing_card(data, prices)
             elif action == "config":
                 card = create_config_card()
             elif action == "toggle_mm":
                 bot_state.market_maker_enabled = not bot_state.market_maker_enabled
-                prices = await get_prices()
                 card = create_main_dashboard_card(prices)
             elif action == "toggle_arb":
                 bot_state.arbitrage_enabled = not bot_state.arbitrage_enabled
-                prices = await get_prices()
                 card = create_main_dashboard_card(prices)
             else:
-                prices = await get_prices()
                 card = create_main_dashboard_card(prices)
 
             return Response(content=json.dumps({"card": card}), media_type="application/json")
@@ -501,7 +632,15 @@ async def handle_webhook(request: Request) -> Response:
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "bot": bot_state.to_dict()}
+    prices = await get_prices()
+    return {
+        "status": "ok", 
+        "bot": bot_state.to_dict(),
+        "prices": {
+            "btc": prices.get("btc", 0),
+            "eth": prices.get("eth", 0)
+        }
+    }
 
 
 app = gr.mount_gradio_app(app, demo, path="/")
