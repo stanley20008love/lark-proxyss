@@ -2,7 +2,7 @@
 const HF_SPACE_URL = process.env.HF_SPACE_URL || 'https://stanley2000008love-multi-agent-lark-bot.hf.space';
 const LARK_APP_ID = process.env.LARK_APP_ID || 'cli_a9f678dd01b8de1b';
 const LARK_APP_SECRET = process.env.LARK_APP_SECRET || '4NJnbgKT1cGjc8ddKhrjNcrEgsCT368K';
-const LARK_API = 'https://open.lark.cn/open-apis';
+const LARK_API = 'https://open.larksuite.com/open-apis';
 
 let tokenCache = { token: null, expire: 0 };
 
