@@ -1,4 +1,4 @@
-// 飞书机器人 - AI 超级智能版 (NVIDIA NIM API)
+// 飞书机器人 - AI 超级智能版 (NVIDIA NIM API + GLM5)
 const LARK_APP_ID = process.env.LARK_APP_ID || 'cli_a9f678dd01b8de1b';
 const LARK_APP_SECRET = process.env.LARK_APP_SECRET || '4NJnbgKT1cGjc8ddKhrjNcrEgsCT368K';
 const LARK_API = 'https://open.larksuite.com/open-apis';
@@ -9,19 +9,23 @@ const NVIDIA_API = 'https://integrate.api.nvidia.com/v1/chat/completions';
 
 // 可用的顶级模型
 const AI_MODELS = {
+  // 中文最佳 - 默认使用
+  'glm5': 'z-ai/glm5',
+  'glm4': 'z-ai/glm4.7',
+  
   // 超大模型
   'llama-405b': 'meta/llama-3.1-405b-instruct',
   'deepseek-v3': 'deepseek-ai/deepseek-v3.1',
   'mistral-large': 'mistralai/mistral-large-3-675b-instruct-2512',
   'qwen3': 'qwen/qwen3-235b-a22b',
   
-  // 快速响应模型
+  // 快速响应
   'llama-70b': 'meta/llama-3.1-70b-instruct',
   'llama-33-70b': 'meta/llama-3.3-70b-instruct',
   'kimi': 'moonshotai/kimi-k2-instruct',
   
-  // 默认模型 (平衡速度和质量)
-  'default': 'meta/llama-3.1-70b-instruct'
+  // 默认模型
+  'default': 'z-ai/glm5'
 };
 
 let tokenCache = { token: null, expire: 0 };
@@ -92,24 +96,23 @@ async function sendToGroup(chatId, message) {
 
 // ============== NVIDIA NIM AI 对话 ==============
 
-// 调用 NVIDIA NIM API
-async function chatWithNVIDIA(message, model = 'default', systemPrompt = null) {
+async function chatWithNVIDIA(message, model = 'default') {
   const modelId = AI_MODELS[model] || AI_MODELS.default;
   
-  const system = systemPrompt || `你是AI Agent，一个专业的加密货币和区块链助手。
+  const system = `你是AI Agent，一个专业的加密货币和区块链智能助手。
 
-你的能力:
-- 实时加密货币价格查询和分析
-- 区块链技术解释
-- Polymarket 预测市场分析
-- 投资建议和风险管理
-- 市场趋势分析
+核心能力：
+📊 实时加密货币价格查询与分析
+🔗 区块链技术与DeFi知识解答
+🎯 Polymarket预测市场分析
+📈 市场趋势与投资策略建议
+⚠️ 风险管理与投资警示
 
-回复风格:
-- 简洁专业
+回复风格：
+- 专业但易懂
 - 使用表情符号增加可读性
-- 提供有价值的信息
-- 对投资问题提醒风险`;
+- 提供有价值的深度信息
+- 投资相关问题必须提醒风险`;
 
   try {
     const res = await fetch(NVIDIA_API, {
@@ -125,7 +128,7 @@ async function chatWithNVIDIA(message, model = 'default', systemPrompt = null) {
           { role: 'user', content: message }
         ],
         temperature: 0.7,
-        max_tokens: 1024
+        max_tokens: 1500
       })
     });
     
@@ -139,11 +142,6 @@ async function chatWithNVIDIA(message, model = 'default', systemPrompt = null) {
     console.error('AI 对话失败:', e);
   }
   return null;
-}
-
-// 使用大模型深度分析
-async function deepAnalysis(message) {
-  return await chatWithNVIDIA(message, 'llama-70b');
 }
 
 // ============== 加密货币数据 ==============
@@ -236,6 +234,7 @@ async function processMessage(text) {
   // 帮助
   if (t === 'help' || t === '/help' || t === '?' || t === '帮助' || t === '菜单') {
     return `🤖 AI Agent 超级智能助手
+📍 默认模型: GLM5 (智谱AI)
 
 📊 行情查询:
   btc - 比特币价格
@@ -246,10 +245,16 @@ async function processMessage(text) {
 🎯 Polymarket:
   polymarket - 预测市场
 
-💡 AI 对话 (任意问题):
-  例如: "BTC后市怎么看？"
+💡 AI 智能对话:
+  直接问任何问题，例如:
+  "BTC后市怎么看？"
   "什么是DeFi？"
   "分析一下当前市场"
+  "如何进行风险管理？"
+
+🧠 可用模型:
+  glm5, glm4, deepseek, qwen3
+  llama-405b, kimi 等
 
 📝 其他:
   time - 时间
@@ -279,14 +284,24 @@ async function processMessage(text) {
 
 🔗 polymarket.com
 
-💡 问我关于预测市场的问题
-例如: "如何分析预测市场？"`;
+💡 可以问我:
+  "如何分析预测市场？"
+  "Polymarket怎么玩？"`;
   }
   
   // 时间
   if (t === 'time' || t === '时间') {
     const now = new Date();
     return `🕐 ${now.toISOString().replace('T', ' ').substring(0, 19)} UTC`;
+  }
+  
+  // 切换模型
+  if (t.startsWith('model ')) {
+    const model = text.substring(6).trim().toLowerCase();
+    if (AI_MODELS[model]) {
+      return `✅ 已切换到模型: ${model}\n\n可用模型: ${Object.keys(AI_MODELS).filter(k => k !== 'default').join(', ')}`;
+    }
+    return `❌ 未知模型: ${model}\n\n可用模型: ${Object.keys(AI_MODELS).filter(k => k !== 'default').join(', ')}`;
   }
   
   // 默认：AI 智能回复
@@ -319,9 +334,9 @@ export default async function handler(req, res) {
     return res.status(200).json({ 
       status: 'ok', 
       service: 'lark-ai-super-agent',
-      version: '4.0.0',
-      ai: 'NVIDIA NIM - Llama 3.1 70B',
-      models: Object.keys(AI_MODELS)
+      version: '5.0.0',
+      default_model: 'GLM5 (智谱AI)',
+      models: Object.keys(AI_MODELS).filter(k => k !== 'default')
     });
   }
   
