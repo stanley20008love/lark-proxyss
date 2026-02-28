@@ -1,4 +1,4 @@
-// 飞书机器人 Webhook - 完整增强版
+// 飞书机器人 Webhook - 完整增强版 (支持群聊)
 const HF_SPACE_URL = process.env.HF_SPACE_URL || 'https://stanley2000008love-multi-agent-lark-bot.hf.space';
 const LARK_APP_ID = process.env.LARK_APP_ID || 'cli_a9f678dd01b8de1b';
 const LARK_APP_SECRET = process.env.LARK_APP_SECRET || '4NJnbgKT1cGjc8ddKhrjNcrEgsCT368K';
@@ -25,7 +25,7 @@ async function getLarkToken() {
   return null;
 }
 
-// 发送飞书消息
+// 发送私聊消息
 async function sendLarkMessage(openId, message) {
   const token = await getLarkToken();
   if (!token) return false;
@@ -36,8 +36,41 @@ async function sendLarkMessage(openId, message) {
       body: JSON.stringify({ receive_id: openId, msg_type: 'text', content: JSON.stringify({ text: message }) })
     });
     const result = await res.json();
+    console.log('私聊发送结果:', result);
     return result.code === 0;
-  } catch (e) { return false; }
+  } catch (e) { console.error('私聊发送失败:', e); return false; }
+}
+
+// 回复消息 (群聊使用)
+async function replyLarkMessage(messageId, message) {
+  const token = await getLarkToken();
+  if (!token) return false;
+  try {
+    const res = await fetch(`${LARK_API}/im/v1/messages/${messageId}/reply`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ msg_type: 'text', content: JSON.stringify({ text: message }) })
+    });
+    const result = await res.json();
+    console.log('群聊回复结果:', result);
+    return result.code === 0;
+  } catch (e) { console.error('群聊回复失败:', e); return false; }
+}
+
+// 发送消息到群聊
+async function sendToGroup(chatId, message) {
+  const token = await getLarkToken();
+  if (!token) return false;
+  try {
+    const res = await fetch(`${LARK_API}/im/v1/messages?receive_id_type=chat_id`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ receive_id: chatId, msg_type: 'text', content: JSON.stringify({ text: message }) })
+    });
+    const result = await res.json();
+    console.log('群聊发送结果:', result);
+    return result.code === 0;
+  } catch (e) { console.error('群聊发送失败:', e); return false; }
 }
 
 // 获取 BTC 价格
@@ -189,7 +222,7 @@ export default async function handler(req, res) {
     return res.status(200).json({ 
       status: 'ok', 
       service: 'lark-webhook-proxy',
-      version: '2.0.0',
+      version: '2.1.0',
       hf_space: HF_SPACE_URL
     });
   }
@@ -200,7 +233,7 @@ export default async function handler(req, res) {
     try { body = JSON.parse(body); } catch (e) {}
   }
   
-  console.log('收到请求:', JSON.stringify(body).substring(0, 300));
+  console.log('收到请求:', JSON.stringify(body).substring(0, 500));
   
   // URL验证 - 必须返回 JSON
   if (body && body.type === 'url_verification') {
@@ -214,6 +247,14 @@ export default async function handler(req, res) {
       const msg = body.event?.message || {};
       const senderId = body.event?.sender?.sender_id || {};
       
+      // 获取消息信息
+      const chatType = msg.chat_type || 'p2p';  // p2p = 私聊, group = 群聊
+      const messageId = msg.message_id || '';
+      const chatId = msg.chat_id || '';
+      const openId = senderId.open_id || '';
+      
+      console.log(`消息类型: ${chatType}, 消息ID: ${messageId}, 群ID: ${chatId}, 用户: ${openId}`);
+      
       if (msg.message_type === 'text') {
         let text = '';
         try {
@@ -222,20 +263,38 @@ export default async function handler(req, res) {
           text = msg.content || '';
         }
         
-        const openId = senderId.open_id || '';
+        // 移除 @机器人 的部分
+        const mentions = msg.mentions || [];
+        if (mentions.length > 0) {
+          // 移除所有 @ 提及
+          for (const mention of mentions) {
+            if (mention.key) {
+              text = text.replace(mention.key, '').trim();
+            }
+          }
+        }
         
-        if (text && openId) {
-          console.log(`消息来自 ${openId}: ${text}`);
+        text = text.trim();
+        
+        if (text) {
+          console.log(`处理消息: "${text}" (类型: ${chatType})`);
           
-          // 先尝试转发到 HF Space
-          const hfResult = await forwardToHF(body);
-          console.log('HF结果:', hfResult);
+          const reply = await processMessage(text);
           
-          // 如果 HF Space 失败，本地处理
-          if (hfResult.code !== 0) {
-            console.log('HF失败，本地处理');
-            const reply = await processMessage(text);
-            await sendLarkMessage(openId, reply);
+          if (chatType === 'group') {
+            // 群聊：回复到群里
+            console.log('群聊回复模式');
+            if (messageId) {
+              await replyLarkMessage(messageId, reply);
+            } else if (chatId) {
+              await sendToGroup(chatId, reply);
+            }
+          } else {
+            // 私聊：直接发送
+            console.log('私聊回复模式');
+            if (openId) {
+              await sendLarkMessage(openId, reply);
+            }
           }
         }
       }
