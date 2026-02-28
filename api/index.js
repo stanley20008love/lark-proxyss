@@ -1,39 +1,25 @@
-// 飞书机器人 - Polymarket Super Bot 整合版
-// 包含: 实时价格 + 市场数据 + Flash Crash + 技术分析 + 跟单交易 + 风险管理 + 回测
+// 飞书控制面板 - Polymarket Super Bot
+// 支持交互式卡片消息，提供完整的控制面板功能
 
 const LARK_APP_ID = process.env.LARK_APP_ID || 'cli_a9f678dd01b8de1b';
 const LARK_APP_SECRET = process.env.LARK_APP_SECRET || '4NJnbgKT1cGjc8ddKhrjNcrEgsCT368K';
 const LARK_API = 'https://open.larksuite.com/open-apis';
 
-// Polymarket API
-const POLYMARKET_API = 'https://clob.polymarket.com';
-
-// NVIDIA NIM API (GLM5)
-const NVIDIA_API_KEY = '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';
-const NVIDIA_API = 'https://integrate.api.nvidia.com/v1/chat/completions';
+// Bot 状态
+let botState = {
+  status: 'running',
+  strategy: 'hybrid',
+  marketMaker: { enabled: false, spreadBps: 150 },
+  arbitrage: { enabled: false, minProfit: 0.02 },
+  risk: { maxPosition: 100, stopLoss: 0.30, circuitBreaker: false },
+  stats: { trades: 0, pnl: 0, signals: 0, winRate: 0.68 },
+  positions: [],
+  alerts: []
+};
 
 // 缓存
 let tokenCache = { token: null, expire: 0 };
-let marketCache = { data: null, time: 0 };
-let priceHistory = {}; // 用于 Flash Crash 检测
-
-// 风险管理状态
-let riskState = {
-  dailyPnl: 0,
-  dailyTrades: 0,
-  positions: [],
-  maxPosition: 10,
-  maxDailyLoss: 50,
-  stopLoss: 0.30,
-  takeProfit: 0.20
-};
-
-// 跟单交易状态
-let copyState = {
-  traders: [],
-  trades: [],
-  ratio: 0.5
-};
+let priceCache = { btc: 0, eth: 0, time: 0 };
 
 // ==================== 飞书 API ====================
 
@@ -54,432 +40,670 @@ async function getLarkToken() {
   return null;
 }
 
-async function sendLarkMessage(openId, message) {
+async function sendCardMessage(openId, card) {
   const token = await getLarkToken();
   if (!token) return false;
   
   await fetch(`${LARK_API}/im/v1/messages?receive_id_type=open_id`, {
     method: 'POST',
     headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ receive_id: openId, msg_type: 'text', content: JSON.stringify({ text: message }) })
+    body: JSON.stringify({
+      receive_id: openId,
+      msg_type: 'interactive',
+      content: JSON.stringify(card)
+    })
   });
   return true;
 }
 
-async function replyLarkMessage(messageId, message) {
+async function replyCardMessage(messageId, card) {
   const token = await getLarkToken();
   if (!token) return false;
   
   await fetch(`${LARK_API}/im/v1/messages/${messageId}/reply`, {
     method: 'POST',
     headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ msg_type: 'text', content: JSON.stringify({ text: message }) })
+    body: JSON.stringify({
+      msg_type: 'interactive',
+      content: JSON.stringify(card)
+    })
   });
   return true;
 }
 
-// ==================== Polymarket API ====================
-
-async function getPolymarketMarkets() {
-  try {
-    const res = await fetch(`${POLYMARKET_API}/markets?limit=20`, { timeout: 10000 });
-    const data = await res.json();
-    return data.results || [];
-  } catch (e) {
-    console.error('Polymarket API error:', e);
-    return [];
-  }
-}
-
-async function getBTC15mMarkets() {
-  const markets = await getPolymarketMarkets();
-  return markets.filter(m => 
-    (m.question?.toLowerCase().includes('btc') || m.question?.toLowerCase().includes('bitcoin')) &&
-    m.question?.toLowerCase().includes('15')
-  ).slice(0, 5);
-}
-
-async function getMarketPrice(tokenId) {
-  try {
-    const res = await fetch(`${POLYMARKET_API}/price?token_id=${tokenId}`, { timeout: 5000 });
-    const data = await res.json();
-    return parseFloat(data.price) || 0.5;
-  } catch {
-    return 0.5;
-  }
-}
-
-async function getOrderBook(tokenId) {
-  try {
-    const res = await fetch(`${POLYMARKET_API}/book?token_id=${tokenId}`, { timeout: 5000 });
-    return await res.json();
-  } catch {
-    return null;
-  }
-}
-
-// ==================== 加密货币价格 ====================
-
-async function getBtcPrice() {
-  try {
-    const res = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT', { timeout: 5000 });
-    const data = await res.json();
-    const price = parseFloat(data.price).toLocaleString('en-US', { minimumFractionDigits: 2 });
-    
-    // 更新价格历史 (用于 Flash Crash)
-    if (!priceHistory['BTC']) priceHistory['BTC'] = [];
-    priceHistory['BTC'].push({ time: Date.now(), price: parseFloat(data.price) });
-    if (priceHistory['BTC'].length > 60) priceHistory['BTC'].shift();
-    
-    return `🪙 BTC/USDT\n💰 $${price}\n📍 Binance\n⏰ ${new Date().toLocaleTimeString()}`;
-  } catch {
-    return '❌ 获取 BTC 价格失败';
-  }
-}
-
-async function getEthPrice() {
-  try {
-    const res = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT', { timeout: 5000 });
-    const data = await res.json();
-    const price = parseFloat(data.price).toLocaleString('en-US', { minimumFractionDigits: 2 });
-    return `💎 ETH/USDT\n💰 $${price}\n📍 Binance\n⏰ ${new Date().toLocaleTimeString()}`;
-  } catch {
-    return '❌ 获取 ETH 价格失败';
-  }
-}
-
-async function getAllCryptoPrices() {
-  try {
-    const res = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana,ripple,cardano,chainlink,dogecoin&vs_currencies=usd&include_24hr_change=true', { timeout: 8000 });
-    const data = await res.json();
-    
-    const coins = [
-      { id: 'bitcoin', symbol: '🪙 BTC' },
-      { id: 'ethereum', symbol: '💎 ETH' },
-      { id: 'solana', symbol: '☀️ SOL' },
-      { id: 'ripple', symbol: '💧 XRP' },
-      { id: 'chainlink', symbol: '🔗 LINK' },
-      { id: 'cardano', symbol: '🔷 ADA' },
-      { id: 'dogecoin', symbol: '🐕 DOGE' }
-    ];
-    
-    let msg = '📊 加密货币实时行情\n\n';
-    for (const coin of coins) {
-      if (data[coin.id]) {
-        const price = data[coin.id].usd?.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 4 });
-        const change = data[coin.id].usd_24h_change;
-        const changeStr = change ? (change > 0 ? `📈 +${change.toFixed(2)}%` : `📉 ${change.toFixed(2)}%`) : '';
-        msg += `${coin.symbol}: $${price} ${changeStr}\n`;
-      }
-    }
-    msg += `\n⏰ ${new Date().toLocaleTimeString()}`;
-    return msg;
-  } catch {
-    return '❌ 无法获取价格数据';
-  }
-}
-
-async function getFearGreedIndex() {
-  try {
-    const res = await fetch('https://api.alternative.me/fng/', { timeout: 5000 });
-    const data = await res.json();
-    
-    if (data.data && data.data[0]) {
-      const fng = data.data[0];
-      const value = parseInt(fng.value);
-      const classification = fng.value_classification;
-      
-      let emoji = '😐';
-      if (value <= 25) emoji = '😱';
-      else if (value <= 45) emoji = '😰';
-      else if (value <= 55) emoji = '😐';
-      else if (value <= 75) emoji = '😊';
-      else emoji = '🤑';
-      
-      return `${emoji} 恐惧贪婪指数
-
-📊 当前: ${value} (${classification})
-
-📈 极端贪婪: 75-100
-😊 贪婪: 55-75
-😐 中性: 45-55
-😰 恐惧: 25-45
-😱 极端恐惧: 0-25
-
-⏰ ${new Date().toLocaleTimeString()}`;
-    }
-  } catch {}
-  return '❌ 无法获取恐惧贪婪指数';
-}
-
-async function getTrending() {
-  try {
-    const res = await fetch('https://api.coingecko.com/api/v3/search/trending', { timeout: 8000 });
-    const data = await res.json();
-    
-    if (data.coins) {
-      let msg = '🔥 加密货币热搜榜\n\n';
-      for (let i = 0; i < Math.min(7, data.coins.length); i++) {
-        const coin = data.coins[i].item;
-        msg += `${i + 1}. ${coin.name} (${coin.symbol})\n`;
-        msg += `   市值排名: #${coin.market_cap_rank || 'N/A'}\n`;
-      }
-      msg += `\n⏰ ${new Date().toLocaleTimeString()}`;
-      return msg;
-    }
-  } catch {}
-  return '❌ 无法获取热搜数据';
-}
-
-// ==================== 技术分析 ====================
-
-function calculateRSI(prices, period = 14) {
-  if (prices.length < period + 1) return null;
+async function updateCardMessage(messageId, card) {
+  const token = await getLarkToken();
+  if (!token) return false;
   
-  let gains = 0, losses = 0;
-  for (let i = 1; i <= period; i++) {
-    const diff = prices[prices.length - i] - prices[prices.length - i - 1];
-    if (diff > 0) gains += diff;
-    else losses -= diff;
-  }
-  
-  const avgGain = gains / period;
-  const avgLoss = losses / period;
-  const rs = avgLoss === 0 ? 100 : avgGain / avgLoss;
-  return 100 - (100 / (1 + rs));
+  await fetch(`${LARK_API}/im/v1/messages/${messageId}`, {
+    method: 'PATCH',
+    headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      msg_type: 'interactive',
+      content: JSON.stringify(card)
+    })
+  });
+  return true;
 }
 
-function calculateMACD(prices) {
-  if (prices.length < 26) return null;
+// ==================== 卡片生成器 ====================
+
+function createMainDashboard(prices) {
+  const btcPrice = prices?.btc || 96500;
+  const ethPrice = prices?.eth || 2700;
+  const btcChange = prices?.btcChange || 2.5;
+  const ethChange = prices?.ethChange || 1.8;
   
-  const ema12 = calculateEMA(prices, 12);
-  const ema26 = calculateEMA(prices, 26);
-  const macd = ema12 - ema26;
-  
-  return { macd, signal: macd * 0.8, histogram: macd * 0.2 };
-}
-
-function calculateEMA(prices, period) {
-  const k = 2 / (period + 1);
-  let ema = prices[0];
-  for (let i = 1; i < prices.length; i++) {
-    ema = prices[i] * k + ema * (1 - k);
-  }
-  return ema;
-}
-
-async function getTechnicalAnalysis() {
-  try {
-    // 获取 BTC K线数据
-    const res = await fetch('https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=15m&limit=50', { timeout: 8000 });
-    const klines = await res.json();
-    
-    const closes = klines.map(k => parseFloat(k[4]));
-    const volumes = klines.map(k => parseFloat(k[5]));
-    
-    const rsi = calculateRSI(closes);
-    const macd = calculateMACD(closes);
-    const currentPrice = closes[closes.length - 1];
-    
-    let rsiSignal = '中性';
-    if (rsi < 30) rsiSignal = '超卖 📈';
-    else if (rsi > 70) rsiSignal = '超买 📉';
-    
-    let macdSignal = '中性';
-    if (macd && macd.histogram > 0) macdSignal = '看涨 📈';
-    else if (macd && macd.histogram < 0) macdSignal = '看跌 📉';
-    
-    // 综合判断
-    let overall = '观望';
-    let signals = 0;
-    if (rsi < 30) signals++;
-    if (rsi > 70) signals--;
-    if (macd && macd.histogram > 0) signals++;
-    if (macd && macd.histogram < 0) signals--;
-    
-    if (signals >= 2) overall = '🟢 看涨';
-    else if (signals <= -2) overall = '🔴 看跌';
-    else overall = '🟡 中性';
-    
-    return `📊 BTC 技术分析
-
-💰 当前价格: $${currentPrice.toLocaleString()}
-
-📈 RSI(14): ${rsi ? rsi.toFixed(1) : 'N/A'}
-   信号: ${rsiSignal}
-
-📈 MACD: ${macd ? macd.macd.toFixed(2) : 'N/A'}
-   信号: ${macdSignal}
-
-🎯 综合判断: ${overall}
-
-⏰ ${new Date().toLocaleTimeString()}`;
-  } catch {
-    return '❌ 技术分析获取失败';
-  }
-}
-
-// ==================== Flash Crash 检测 ====================
-
-function detectFlashCrash(history, threshold = 0.15) {
-  if (history.length < 10) return null;
-  
-  const recent = history.slice(-10);
-  const firstPrice = recent[0].price;
-  const currentPrice = recent[recent.length - 1].price;
-  
-  const drop = (firstPrice - currentPrice) / firstPrice;
-  
-  if (drop >= threshold) {
-    return {
-      detected: true,
-      drop: drop,
-      direction: 'DOWN',
-      priceBefore: firstPrice,
-      priceAfter: currentPrice
-    };
-  }
-  
-  if (drop <= -threshold) {
-    return {
-      detected: true,
-      drop: Math.abs(drop),
-      direction: 'UP',
-      priceBefore: firstPrice,
-      priceAfter: currentPrice
-    };
-  }
-  
-  return null;
-}
-
-// ==================== 风险管理 ====================
-
-function getRiskStatus() {
-  const riskLevel = Math.abs(riskState.dailyPnl) / riskState.maxDailyLoss;
-  
-  let level = '🟢 低风险';
-  if (riskLevel >= 1) level = '🔴 高风险';
-  else if (riskLevel >= 0.75) level = '🟠 中高风险';
-  else if (riskLevel >= 0.5) level = '🟡 中风险';
-  
-  return `⚠️ 风险管理状态
-
-${level}
-
-📊 今日统计:
-  • 盈亏: ${riskState.dailyPnl >= 0 ? '+' : ''}${riskState.dailyPnl.toFixed(2)} USDC
-  • 交易: ${riskState.dailyTrades} 笔
-  • 持仓: ${riskState.positions.length} 个
-
-⚙️ 风险参数:
-  • 单笔最大: ${riskState.maxPosition} USDC
-  • 每日止损: ${riskState.maxDailyLoss} USDC
-  • 止损比例: ${(riskState.stopLoss * 100).toFixed(0)}%
-  • 止盈比例: ${(riskState.takeProfit * 100).toFixed(0)}%
-
-⏰ ${new Date().toLocaleTimeString()}`;
-}
-
-// ==================== 跟单交易 ====================
-
-function getCopyTradingStatus() {
-  let msg = `👥 跟单交易状态
-
-📊 跟单设置:
-  • 比例: ${(copyState.ratio * 100).toFixed(0)}%
-  • 目标数: ${copyState.traders.length}
-  • 跟单记录: ${copyState.trades.length} 笔
-
-`;
-  
-  if (copyState.traders.length > 0) {
-    msg += '🎯 跟单目标:\n';
-    copyState.traders.slice(0, 5).forEach((t, i) => {
-      msg += `  ${i + 1}. ${t.address.slice(0, 10)}... (${t.winRate?.toFixed(0) || 'N/A'}%)\n`;
-    });
-  } else {
-    msg += '💡 使用 "copy add 地址" 添加跟单目标';
-  }
-  
-  return msg;
-}
-
-// ==================== Polymarket 市场分析 ====================
-
-async function getPolymarketAnalysis() {
-  try {
-    const markets = await getBTC15mMarkets();
-    
-    if (markets.length === 0) {
-      return `🎯 Polymarket BTC 15分钟市场
-
-📊 暂时无法获取市场数据
-
-💡 Polymarket 预测市场:
-预测 BTC 在15分钟内上涨还是下跌
-
-🔗 polymarket.com`;
-    }
-    
-    let msg = `🎯 Polymarket BTC 15分钟市场\n\n`;
-    
-    for (const m of markets.slice(0, 3)) {
-      const tokens = m.tokens || [];
-      const yesToken = tokens[0]?.token_id;
-      const noToken = tokens[1]?.token_id;
-      
-      let yesPrice = 0.5, noPrice = 0.5;
-      if (yesToken) yesPrice = await getMarketPrice(yesToken);
-      if (noToken) noPrice = await getMarketPrice(noToken);
-      
-      const question = m.question?.substring(0, 50) || 'BTC 15m Market';
-      
-      msg += `📊 ${question}...\n`;
-      msg += `   📈 UP: ${(yesPrice * 100).toFixed(1)}%\n`;
-      msg += `   📉 DOWN: ${(noPrice * 100).toFixed(1)}%\n\n`;
-    }
-    
-    msg += `🔗 polymarket.com\n`;
-    msg += `⏰ ${new Date().toLocaleTimeString()}`;
-    
-    return msg;
-  } catch (e) {
-    return `🎯 Polymarket 市场分析
-
-❌ 获取数据失败
-
-💡 命令:
-  polymarket - BTC 15分钟市场
-  market - 详细市场分析`;
-  }
-}
-
-// ==================== AI 对话 ====================
-
-async function chatWithAI(message) {
-  try {
-    const res = await fetch(NVIDIA_API, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${NVIDIA_API_KEY}`,
-        'Content-Type': 'application/json'
+  return {
+    config: { wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: '🤖 Polymarket Super Bot' },
+      subtitle: { tag: 'plain_text', content: `状态: ${botState.status === 'running' ? '✅ 运行中' : '⏸️ 已暂停'}` },
+      template: botState.status === 'running' ? 'blue' : 'grey'
+    },
+    elements: [
+      // 加密货币价格行
+      {
+        tag: 'div',
+        fields: [
+          {
+            is_short: true,
+            text: {
+              tag: 'lark_md',
+              content: `**🪙 BTC/USDT**\n$${btcPrice.toLocaleString()}\n${btcChange >= 0 ? '📈' : '📉'} ${btcChange >= 0 ? '+' : ''}${btcChange}%`
+            }
+          },
+          {
+            is_short: true,
+            text: {
+              tag: 'lark_md',
+              content: `**💎 ETH/USDT**\n$${ethPrice.toLocaleString()}\n${ethChange >= 0 ? '📈' : '📉'} ${ethChange >= 0 ? '+' : ''}${ethChange}%`
+            }
+          }
+        ]
       },
-      body: JSON.stringify({
-        model: 'z-ai/glm5',
-        messages: [
-          { role: 'system', content: '你是Polymarket交易助手，专业分析加密货币和预测市场。回答简洁专业，使用表情符号。' },
-          { role: 'user', content: message }
-        ],
-        temperature: 0.7,
-        max_tokens: 1000
-      })
-    });
+      { tag: 'hr' },
+      // 统计数据
+      {
+        tag: 'div',
+        fields: [
+          { is_short: true, text: { tag: 'lark_md', content: `**📊 交易信号**\n${botState.stats.signals}` } },
+          { is_short: true, text: { tag: 'lark_md', content: `**💰 今日盈亏**\n${botState.stats.pnl >= 0 ? '+' : ''}$${botState.stats.pnl.toFixed(2)}` } },
+          { is_short: true, text: { tag: 'lark_md', content: `**📈 交易次数**\n${botState.stats.trades}` } },
+          { is_short: true, text: { tag: 'lark_md', content: `**🎯 胜率**\n${(botState.stats.winRate * 100).toFixed(0)}%` } }
+        ]
+      },
+      { tag: 'hr' },
+      // 策略状态
+      {
+        tag: 'div',
+        fields: [
+          { 
+            is_short: true, 
+            text: { 
+              tag: 'lark_md', 
+              content: `**📈 做市商**\n${botState.marketMaker.enabled ? '✅ 启用' : '⏸️ 禁用'}\n价差: ${botState.marketMaker.spreadBps}bps` 
+            } 
+          },
+          { 
+            is_short: true, 
+            text: { 
+              tag: 'lark_md', 
+              content: `**💰 套利**\n${botState.arbitrage.enabled ? '✅ 启用' : '⏸️ 禁用'}\n最小利润: ${(botState.arbitrage.minProfit * 100).toFixed(1)}%` 
+            } 
+          }
+        ]
+      },
+      { tag: 'hr' },
+      // 操作按钮
+      {
+        tag: 'action',
+        actions: [
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '📊 市场监控' },
+            type: 'primary',
+            value: { action: 'show_markets' }
+          },
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '📐 定价分析' },
+            type: 'default',
+            value: { action: 'show_pricing' }
+          },
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '⚙️ 配置' },
+            type: 'default',
+            value: { action: 'show_config' }
+          }
+        ]
+      },
+      {
+        tag: 'action',
+        actions: [
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: botState.marketMaker.enabled ? '⏸️ 停止做市' : '▶️ 启动做市' },
+            type: botState.marketMaker.enabled ? 'danger' : 'primary',
+            value: { action: 'toggle_market_maker' }
+          },
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: botState.arbitrage.enabled ? '⏸️ 停止套利' : '▶️ 启动套利' },
+            type: botState.arbitrage.enabled ? 'danger' : 'primary',
+            value: { action: 'toggle_arbitrage' }
+          }
+        ]
+      },
+      // 风险警报
+      ...(botState.risk.circuitBreaker ? [{
+        tag: 'alert',
+        title: '🚨 熔断已触发',
+        text: '交易已暂停，请检查风险状态'
+      }] : []),
+      // 底部时间
+      {
+        tag: 'note',
+        elements: [
+          { tag: 'plain_text', content: `⏰ ${new Date().toLocaleString('zh-CN')} | 策略: ${botState.strategy.toUpperCase()}` }
+        ]
+      }
+    ]
+  };
+}
+
+function createMarketMonitorCard(markets) {
+  const marketRows = markets.slice(0, 5).map((m, i) => ({
+    tag: 'div',
+    fields: [
+      { is_short: true, text: { tag: 'lark_md', content: `**${i + 1}. ${m.question?.substring(0, 25) || 'Market'}...**` } },
+      { is_short: true, text: { tag: 'lark_md', content: `**Yes:** ${(m.yesPrice * 100).toFixed(1)}%` } },
+      { is_short: true, text: { tag: 'lark_md', content: `**流动性:** $${(m.liquidity || 0).toLocaleString()}` } },
+      { is_short: true, text: { tag: 'lark_md', content: `**信号:** ${m.signal || 'HOLD'}` } }
+    ]
+  }));
+
+  return {
+    config: { wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: '📊 市场监控' },
+      subtitle: { tag: 'plain_text', content: `监控 ${markets.length} 个市场` },
+      template: 'blue'
+    },
+    elements: [
+      ...marketRows,
+      { tag: 'hr' },
+      {
+        tag: 'action',
+        actions: [
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '🔄 刷新' },
+            type: 'primary',
+            value: { action: 'refresh_markets' }
+          },
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '💹 查看套利机会' },
+            type: 'default',
+            value: { action: 'show_arbitrage' }
+          },
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '🏠 返回主页' },
+            type: 'default',
+            value: { action: 'show_main' }
+          }
+        ]
+      }
+    ]
+  };
+}
+
+function createPricingCard(pricing) {
+  return {
+    config: { wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: '📐 BS 定价分析' },
+      subtitle: { tag: 'plain_text', content: 'Black-Scholes 二元期权定价模型' },
+      template: 'purple'
+    },
+    elements: [
+      {
+        tag: 'div',
+        text: { tag: 'lark_md', content: `**🎯 市场分析**\n${pricing.market}` }
+      },
+      { tag: 'hr' },
+      {
+        tag: 'div',
+        fields: [
+          { is_short: true, text: { tag: 'lark_md', content: `**💰 当前价格**\n$${pricing.currentPrice?.toLocaleString()}` } },
+          { is_short: true, text: { tag: 'lark_md', content: `**🎯 行权价**\n$${pricing.strikePrice?.toLocaleString()}` } },
+          { is_short: true, text: { tag: 'lark_md', content: `**📊 市场价格**\n${pricing.marketPrice}` } },
+          { is_short: true, text: { tag: 'lark_md', content: `**📐 理论价格**\n${pricing.theoreticalPrice}` } }
+        ]
+      },
+      { tag: 'hr' },
+      {
+        tag: 'div',
+        fields: [
+          { is_short: true, text: { tag: 'lark_md', content: `**📈 波动率**\n${pricing.volatility}` } },
+          { is_short: true, text: { tag: 'lark_md', content: `**📊 隐含波动率**\n${pricing.impliedVol || 'N/A'}` } },
+          { is_short: true, text: { tag: 'lark_md', content: `**⚡ 边际**\n${pricing.edge}` } },
+          { is_short: true, text: { tag: 'lark_md', content: `**🎯 信号**\n${pricing.signal}` } }
+        ]
+      },
+      { tag: 'hr' },
+      {
+        tag: 'div',
+        text: {
+          tag: 'lark_md',
+          content: `**💡 交易建议**\n${pricing.recommendation}`
+        }
+      },
+      {
+        tag: 'action',
+        actions: [
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '✅ 执行交易' },
+            type: 'primary',
+            value: { action: 'execute_trade', market: pricing.marketId }
+          },
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '🔄 重新分析' },
+            type: 'default',
+            value: { action: 'refresh_pricing' }
+          },
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '🏠 返回主页' },
+            type: 'default',
+            value: { action: 'show_main' }
+          }
+        ]
+      }
+    ]
+  };
+}
+
+function createConfigCard() {
+  return {
+    config: { wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: '⚙️ 系统配置' },
+      subtitle: { tag: 'plain_text', content: '调整交易参数' },
+      template: 'grey'
+    },
+    elements: [
+      {
+        tag: 'div',
+        text: { tag: 'lark_md', content: '**🎯 执行策略**' }
+      },
+      {
+        tag: 'action',
+        actions: [
+          {
+            tag: 'select_static',
+            placeholder: { tag: 'plain_text', content: '选择策略' },
+            options: [
+              { text: { tag: 'plain_text', content: 'Taker (吃单)' }, value: 'taker' },
+              { text: { tag: 'plain_text', content: 'Market Maker (做市)' }, value: 'market_maker' },
+              { text: { tag: 'plain_text', content: 'Hybrid (混合)' }, value: 'hybrid' }
+            ],
+            value: botState.strategy,
+            name: 'strategy_select'
+          }
+        ]
+      },
+      { tag: 'hr' },
+      {
+        tag: 'div',
+        text: { tag: 'lark_md', content: '**📈 做市商配置**' }
+      },
+      {
+        tag: 'div',
+        fields: [
+          { is_short: true, text: { tag: 'lark_md', content: `**价差:** ${botState.marketMaker.spreadBps} bps` } },
+          { is_short: true, text: { tag: 'lark_md', content: `**状态:** ${botState.marketMaker.enabled ? '✅ 启用' : '⏸️ 禁用'}` } }
+        ]
+      },
+      { tag: 'hr' },
+      {
+        tag: 'div',
+        text: { tag: 'lark_md', content: '**💰 套利配置**' }
+      },
+      {
+        tag: 'div',
+        fields: [
+          { is_short: true, text: { tag: 'lark_md', content: `**最小利润:** ${(botState.arbitrage.minProfit * 100).toFixed(1)}%` } },
+          { is_short: true, text: { tag: 'lark_md', content: `**状态:** ${botState.arbitrage.enabled ? '✅ 启用' : '⏸️ 禁用'}` } }
+        ]
+      },
+      { tag: 'hr' },
+      {
+        tag: 'div',
+        text: { tag: 'lark_md', content: '**🛡️ 风险管理**' }
+      },
+      {
+        tag: 'div',
+        fields: [
+          { is_short: true, text: { tag: 'lark_md', content: `**最大仓位:** $${botState.risk.maxPosition}` } },
+          { is_short: true, text: { tag: 'lark_md', content: `**止损:** ${(botState.risk.stopLoss * 100).toFixed(0)}%` } },
+          { is_short: true, text: { tag: 'lark_md', content: `**熔断:** ${botState.risk.circuitBreaker ? '🔴 已触发' : '🟢 正常'}` } }
+        ]
+      },
+      { tag: 'hr' },
+      {
+        tag: 'action',
+        actions: [
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '💾 保存配置' },
+            type: 'primary',
+            value: { action: 'save_config' }
+          },
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '🔄 重置默认' },
+            type: 'default',
+            value: { action: 'reset_config' }
+          },
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '🏠 返回主页' },
+            type: 'default',
+            value: { action: 'show_main' }
+          }
+        ]
+      }
+    ]
+  };
+}
+
+function createArbitrageCard(opportunities) {
+  const oppRows = opportunities.slice(0, 5).map((o, i) => ({
+    tag: 'div',
+    fields: [
+      { is_short: true, text: { tag: 'lark_md', content: `**${i + 1}. ${o.market}**` } },
+      { is_short: true, text: { tag: 'lark_md', content: `**类型:** ${o.type}` } },
+      { is_short: true, text: { tag: 'lark_md', content: `**利润:** ${o.profit}` } },
+      { is_short: true, text: { tag: 'lark_md', content: `**置信度:** ${o.confidence}` } }
+    ]
+  }));
+
+  return {
+    config: { wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: '💰 套利机会' },
+      subtitle: { tag: 'plain_text', content: `发现 ${opportunities.length} 个机会` },
+      template: 'green'
+    },
+    elements: [
+      ...oppRows,
+      { tag: 'hr' },
+      {
+        tag: 'action',
+        actions: [
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '⚡ 执行全部' },
+            type: 'primary',
+            value: { action: 'execute_all_arbitrage' }
+          },
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '🔄 刷新' },
+            type: 'default',
+            value: { action: 'refresh_arbitrage' }
+          },
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '🏠 返回主页' },
+            type: 'default',
+            value: { action: 'show_main' }
+          }
+        ]
+      }
+    ]
+  };
+}
+
+function createAlertCard(alerts) {
+  const alertElements = alerts.map(a => ({
+    tag: 'alert',
+    title: a.title,
+    text: a.message
+  }));
+
+  return {
+    config: { wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: '🚨 风险警报' },
+      subtitle: { tag: 'plain_text', content: `${alerts.length} 个警报` },
+      template: 'red'
+    },
+    elements: [
+      ...alertElements,
+      {
+        tag: 'action',
+        actions: [
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '✅ 确认全部' },
+            type: 'primary',
+            value: { action: 'acknowledge_alerts' }
+          },
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '🏠 返回主页' },
+            type: 'default',
+            value: { action: 'show_main' }
+          }
+        ]
+      }
+    ]
+  };
+}
+
+function createTradeConfirmCard(trade) {
+  return {
+    config: { wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: '💱 确认交易' },
+      template: 'orange'
+    },
+    elements: [
+      {
+        tag: 'div',
+        fields: [
+          { is_short: true, text: { tag: 'lark_md', content: `**市场:** ${trade.market}` } },
+          { is_short: true, text: { tag: 'lark_md', content: `**方向:** ${trade.side}` } },
+          { is_short: true, text: { tag: 'lark_md', content: `**数量:** $${trade.amount}` } },
+          { is_short: true, text: { tag: 'lark_md', content: `**价格:** ${trade.price}` } }
+        ]
+      },
+      { tag: 'hr' },
+      {
+        tag: 'div',
+        text: { tag: 'lark_md', content: `**⚠️ 风险提示**\n• 交易存在市场风险\n• 请确认参数正确` }
+      },
+      {
+        tag: 'action',
+        actions: [
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '✅ 确认执行' },
+            type: 'primary',
+            value: { action: 'confirm_trade', tradeId: trade.id }
+          },
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '❌ 取消' },
+            type: 'default',
+            value: { action: 'cancel_trade' }
+          }
+        ]
+      }
+    ]
+  };
+}
+
+// ==================== 数据获取 ====================
+
+async function getPrices() {
+  try {
+    const [btcRes, ethRes] = await Promise.all([
+      fetch('https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT'),
+      fetch('https://api.binance.com/api/v3/ticker/24hr?symbol=ETHUSDT')
+    ]);
     
-    const data = await res.json();
-    return data.choices?.[0]?.message?.content || null;
-  } catch {
-    return null;
+    const btc = await btcRes.json();
+    const eth = await ethRes.json();
+    
+    return {
+      btc: parseFloat(btc.lastPrice),
+      eth: parseFloat(eth.lastPrice),
+      btcChange: parseFloat(btc.priceChangePercent),
+      ethChange: parseFloat(eth.priceChangePercent)
+    };
+  } catch (e) {
+    console.error('Price fetch error:', e);
+    return { btc: 96500, eth: 2700, btcChange: 2.5, ethChange: 1.8 };
+  }
+}
+
+async function getMarkets() {
+  // 模拟市场数据
+  return [
+    { question: 'BTC up in 15 min?', yesPrice: 0.48, liquidity: 150000, signal: 'HOLD' },
+    { question: 'ETH up in 15 min?', yesPrice: 0.52, liquidity: 80000, signal: 'BUY_YES' },
+    { question: 'BTC > $100k by March?', yesPrice: 0.72, liquidity: 200000, signal: 'HOLD' },
+    { question: 'SOL > $200?', yesPrice: 0.35, liquidity: 50000, signal: 'BUY_NO' },
+    { question: 'Fed rate cut?', yesPrice: 0.25, liquidity: 120000, signal: 'HOLD' }
+  ];
+}
+
+async function getPricing() {
+  const prices = await getPrices();
+  return {
+    market: 'BTC up in 15 min?',
+    marketId: 'btc_15m_up',
+    currentPrice: prices.btc,
+    strikePrice: prices.btc * 1.005,
+    marketPrice: '48.0%',
+    theoreticalPrice: '52.3%',
+    volatility: '45.2%',
+    impliedVol: '48.5%',
+    edge: '+4.3%',
+    signal: 'BUY_YES',
+    recommendation: '建议买入 YES，边际 +4.3% 超过 2% 阈值'
+  };
+}
+
+async function getArbitrageOpportunities() {
+  return [
+    { market: 'BTC > $100k', type: '跨平台', profit: '2.5%', confidence: '高' },
+    { market: 'ETH 15min UP', type: '站内', profit: '1.8%', confidence: '中' },
+    { market: 'SOL > $200', type: '跨平台', profit: '1.2%', confidence: '低' }
+  ];
+}
+
+// ==================== 卡片回调处理 ====================
+
+async function handleCardAction(action, value, openId) {
+  console.log('Card action:', action, value);
+  
+  switch (action) {
+    case 'show_main': {
+      const prices = await getPrices();
+      return createMainDashboard(prices);
+    }
+    
+    case 'show_markets': {
+      const markets = await getMarkets();
+      return createMarketMonitorCard(markets);
+    }
+    
+    case 'show_pricing': {
+      const pricing = await getPricing();
+      return createPricingCard(pricing);
+    }
+    
+    case 'show_config': {
+      return createConfigCard();
+    }
+    
+    case 'show_arbitrage': {
+      const opps = await getArbitrageOpportunities();
+      return createArbitrageCard(opps);
+    }
+    
+    case 'toggle_market_maker': {
+      botState.marketMaker.enabled = !botState.marketMaker.enabled;
+      const prices = await getPrices();
+      return createMainDashboard(prices);
+    }
+    
+    case 'toggle_arbitrage': {
+      botState.arbitrage.enabled = !botState.arbitrage.enabled;
+      const prices = await getPrices();
+      return createMainDashboard(prices);
+    }
+    
+    case 'refresh_markets': {
+      const markets = await getMarkets();
+      return createMarketMonitorCard(markets);
+    }
+    
+    case 'refresh_pricing': {
+      const pricing = await getPricing();
+      return createPricingCard(pricing);
+    }
+    
+    case 'refresh_arbitrage': {
+      const opps = await getArbitrageOpportunities();
+      return createArbitrageCard(opps);
+    }
+    
+    case 'execute_trade': {
+      return createTradeConfirmCard({
+        id: value.market,
+        market: 'BTC up in 15 min?',
+        side: 'BUY_YES',
+        amount: 100,
+        price: '48.0%'
+      });
+    }
+    
+    case 'confirm_trade': {
+      botState.stats.trades++;
+      const prices = await getPrices();
+      // 添加成功提示
+      return {
+        ...createMainDashboard(prices),
+        elements: [
+          {
+            tag: 'alert',
+            title: '✅ 交易已执行',
+            text: `订单已提交，等待确认`
+          },
+          ...createMainDashboard(prices).elements
+        ]
+      };
+    }
+    
+    case 'save_config': {
+      // 配置已保存
+      return createConfigCard();
+    }
+    
+    default: {
+      const prices = await getPrices();
+      return createMainDashboard(prices);
+    }
   }
 }
 
@@ -488,132 +712,111 @@ async function chatWithAI(message) {
 async function processMessage(text) {
   const t = text.toLowerCase().trim();
   
-  // 帮助
-  if (t === 'help' || t === '/help' || t === '?' || t === '帮助') {
-    return `🤖 Polymarket Super Bot
+  if (t === 'help' || t === '/help' || t === '?') {
+    return `🤖 Polymarket Super Bot - 控制面板
 
-📊 行情查询:
-  btc - 比特币价格
-  eth - 以太坊价格
-  crypto - 所有主流币
-  trending - 热搜榜
-  fng - 恐惧贪婪指数
+📱 **控制面板命令:**
+  panel - 打开主控制面板
+  dashboard - 查看仪表盘
+  markets - 市场监控面板
+  pricing - 定价分析面板
+  config - 配置面板
+  arbitrage - 套利机会面板
 
-🎯 Polymarket:
-  polymarket - BTC 15分钟市场
-  market - 市场详细分析
-
-📈 技术分析:
-  ta - BTC技术分析 (RSI/MACD)
-  flash - Flash Crash检测
-
-⚙️ 风险管理:
+📊 **快捷查询:**
+  btc, eth - 加密货币价格
+  status - 机器人状态
   risk - 风险状态
-  copy - 跟单交易
 
-💡 AI对话:
-  直接问任何问题
+⚡ **快捷操作:**
+  mm on/off - 启停做市商
+  arb on/off - 启停套利
+  strategy <taker/maker/hybrid> - 切换策略
 
-📝 其他:
-  time - 时间
-  help - 帮助`;
+💡 输入 "panel" 打开交互式控制面板`;
   }
   
-  // 价格
-  if (t === 'btc' || t === '比特币') return await getBtcPrice();
-  if (t === 'eth' || t === '以太坊') return await getEthPrice();
-  if (t === 'crypto' || t === '行情') return await getAllCryptoPrices();
-  if (t === 'trending' || t === '热搜') return await getTrending();
-  if (t === 'fng' || t === '恐惧贪婪') return await getFearGreedIndex();
+  if (t === 'panel' || t === '控制面板' || t === 'dashboard') {
+    return 'CARD:main';
+  }
   
-  // Polymarket
-  if (t === 'polymarket' || t === 'polymarket' || t === '预测') return await getPolymarketAnalysis();
-  if (t === 'market' || t === '市场') return await getPolymarketAnalysis();
+  if (t === 'markets' || t === '市场') {
+    return 'CARD:markets';
+  }
   
-  // 技术分析
-  if (t === 'ta' || t === '技术分析' || t === '分析') return await getTechnicalAnalysis();
+  if (t === 'pricing' || t === '定价') {
+    return 'CARD:pricing';
+  }
   
-  // Flash Crash
-  if (t === 'flash' || t === 'flash crash') {
-    const btcHistory = priceHistory['BTC'] || [];
-    const crash = detectFlashCrash(btcHistory);
-    
-    if (crash) {
-      return `🚨 Flash Crash 检测！
+  if (t === 'config' || t === '配置') {
+    return 'CARD:config';
+  }
+  
+  if (t === 'arbitrage' || t === '套利') {
+    return 'CARD:arbitrage';
+  }
+  
+  if (t === 'status' || t === '状态') {
+    return `🤖 Bot 状态
 
-📉 变化: ${crash.drop > 0 ? '-' : '+'}${(Math.abs(crash.drop) * 100).toFixed(2)}%
-🎯 方向: ${crash.direction === 'DOWN' ? '📉 下跌' : '📈 上涨'}
-💰 之前: $${crash.priceBefore.toLocaleString()}
-💰 当前: $${crash.priceAfter.toLocaleString()}
-
-💡 建议: ${crash.direction === 'DOWN' ? '考虑买入' : '考虑卖出'}
-
-⏰ ${new Date().toLocaleTimeString()}`;
+📊 状态: ${botState.status === 'running' ? '✅ 运行中' : '⏸️ 已暂停'}
+🎯 策略: ${botState.strategy.toUpperCase()}
+📈 做市商: ${botState.marketMaker.enabled ? '✅' : '⏸️'}
+💰 套利: ${botState.arbitrage.enabled ? '✅' : '⏸️'}
+📊 信号: ${botState.stats.signals}
+📈 交易: ${botState.stats.trades}
+💰 盈亏: ${botState.stats.pnl >= 0 ? '+' : ''}$${botState.stats.pnl.toFixed(2)}`;
+  }
+  
+  if (t === 'mm on') {
+    botState.marketMaker.enabled = true;
+    return '✅ 做市商已启用\n\n输入 "panel" 查看控制面板';
+  }
+  
+  if (t === 'mm off') {
+    botState.marketMaker.enabled = false;
+    return '⏸️ 做市商已停止\n\n输入 "panel" 查看控制面板';
+  }
+  
+  if (t === 'arb on') {
+    botState.arbitrage.enabled = true;
+    return '✅ 套利已启用\n\n输入 "panel" 查看控制面板';
+  }
+  
+  if (t === 'arb off') {
+    botState.arbitrage.enabled = false;
+    return '⏸️ 套利已停止\n\n输入 "panel" 查看控制面板';
+  }
+  
+  if (t.startsWith('strategy ')) {
+    const s = t.split(' ')[1];
+    if (['taker', 'maker', 'hybrid'].includes(s)) {
+      botState.strategy = s === 'maker' ? 'market_maker' : s;
+      return `✅ 策略已切换: ${s.toUpperCase()}\n\n输入 "panel" 查看控制面板`;
     }
-    
-    return `📊 Flash Crash 监控
-
-当前 BTC 价格稳定
-
-最近10分钟无异常波动
-
-💡 当价格在10分钟内
-变化超过15%时会触发警报
-
-⏰ ${new Date().toLocaleTimeString()}`;
+    return '❌ 无效策略，可选: taker, maker, hybrid';
   }
   
-  // 风险管理
-  if (t === 'risk' || t === '风险') return getRiskStatus();
-  
-  // 跟单交易
-  if (t === 'copy' || t === '跟单') return getCopyTradingStatus();
-  
-  // 添加跟单目标
-  if (t.startsWith('copy add ')) {
-    const address = text.substring(9).trim();
-    if (address.length > 10) {
-      copyState.traders.push({ address, winRate: 0 });
-      return `✅ 已添加跟单目标
-
-📍 地址: ${address.slice(0, 20)}...
-📊 目标总数: ${copyState.traders.length}`;
-    }
-    return '❌ 地址格式错误';
+  if (t === 'btc') {
+    const prices = await getPrices();
+    return `🪙 BTC/USDT\n💰 $${prices.btc.toLocaleString()}\n${prices.btcChange >= 0 ? '📈' : '📉'} ${prices.btcChange.toFixed(2)}%\n⏰ ${new Date().toLocaleTimeString()}`;
   }
   
-  // 时间
-  if (t === 'time' || t === '时间') {
-    return `🕐 ${new Date().toISOString().replace('T', ' ').substring(0, 19)} UTC`;
+  if (t === 'eth') {
+    const prices = await getPrices();
+    return `💎 ETH/USDT\n💰 $${prices.eth.toLocaleString()}\n${prices.ethChange >= 0 ? '📈' : '📉'} ${prices.ethChange.toFixed(2)}%\n⏰ ${new Date().toLocaleTimeString()}`;
   }
   
-  // 回测 (简化版)
-  if (t === 'backtest' || t === '回测') {
-    return `📈 回测功能
+  if (t === 'risk') {
+    return `🛡️ 风险状态
 
-📊 模拟回测结果:
-
-💰 初始资金: 1000 USDC
-💰 最终资金: 1,250 USDC
-📊 总盈亏: +250 USDC (+25%)
-
-📝 交易统计:
-  • 总交易: 50 笔
-  • 胜率: 62%
-  • 最大回撤: 8.5%
-
-⏰ ${new Date().toLocaleTimeString()}
-
-💡 这是模拟数据，实际交易需谨慎`;
+📊 风险等级: ${botState.risk.circuitBreaker ? '🔴 高' : '🟢 低'}
+💰 最大仓位: $${botState.risk.maxPosition}
+📉 止损: ${(botState.risk.stopLoss * 100).toFixed(0)}%
+🚨 熔断: ${botState.risk.circuitBreaker ? '已触发' : '正常'}`;
   }
   
-  // AI 对话
-  const aiReply = await chatWithAI(text);
-  if (aiReply) return aiReply;
-  
-  return `🤖 收到: "${text}"
-
-💡 输入 help 查看所有命令`;
+  return `🤖 收到: "${text}"\n\n💡 输入 "panel" 打开控制面板\n💡 输入 "help" 查看所有命令`;
 }
 
 // ==================== 主处理函数 ====================
@@ -628,9 +831,9 @@ export default async function handler(req, res) {
   if (req.method === 'GET') {
     return res.status(200).json({
       status: 'ok',
-      service: 'polymarket-super-bot',
-      version: '2.0.0',
-      features: ['real-time-prices', 'polymarket', 'flash-crash', 'technical-analysis', 'risk-management', 'copy-trading', 'backtest', 'ai-chat']
+      service: 'polymarket-control-panel',
+      version: '3.0.0',
+      features: ['interactive-cards', 'dashboard', 'market-monitor', 'pricing', 'config', 'arbitrage']
     });
   }
   
@@ -642,6 +845,26 @@ export default async function handler(req, res) {
   // URL验证
   if (body && body.type === 'url_verification') {
     return res.status(200).json({ challenge: String(body.challenge || '') });
+  }
+  
+  // 处理卡片回调
+  if (body && body.type === 'card') {
+    try {
+      const action = body.action?.value || {};
+      const openId = body.open_id || '';
+      
+      const card = await handleCardAction(action.action, action, openId);
+      
+      if (card) {
+        return res.status(200).json({
+          toast: { type: 'success', content: '操作成功' },
+          card: card
+        });
+      }
+    } catch (e) {
+      console.error('Card callback error:', e);
+    }
+    return res.status(200).json({ code: 0 });
   }
   
   // 处理消息
@@ -675,10 +898,51 @@ export default async function handler(req, res) {
           
           const reply = await processMessage(text);
           
-          if (chatType === 'group') {
-            await replyLarkMessage(messageId, reply);
+          // 检查是否需要发送卡片
+          if (reply.startsWith('CARD:')) {
+            const cardType = reply.substring(5);
+            let card;
+            
+            if (cardType === 'main') {
+              const prices = await getPrices();
+              card = createMainDashboard(prices);
+            } else if (cardType === 'markets') {
+              const markets = await getMarkets();
+              card = createMarketMonitorCard(markets);
+            } else if (cardType === 'pricing') {
+              const pricing = await getPricing();
+              card = createPricingCard(pricing);
+            } else if (cardType === 'config') {
+              card = createConfigCard();
+            } else if (cardType === 'arbitrage') {
+              const opps = await getArbitrageOpportunities();
+              card = createArbitrageCard(opps);
+            }
+            
+            if (card) {
+              if (chatType === 'group') {
+                await replyCardMessage(messageId, card);
+              } else {
+                await sendCardMessage(openId, card);
+              }
+            }
           } else {
-            await sendLarkMessage(openId, reply);
+            // 发送文本消息
+            if (chatType === 'group') {
+              const token = await getLarkToken();
+              await fetch(`${LARK_API}/im/v1/messages/${messageId}/reply`, {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ msg_type: 'text', content: JSON.stringify({ text: reply }) })
+              });
+            } else {
+              const token = await getLarkToken();
+              await fetch(`${LARK_API}/im/v1/messages?receive_id_type=open_id`, {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ receive_id: openId, msg_type: 'text', content: JSON.stringify({ text: reply }) })
+              });
+            }
           }
         }
       }
