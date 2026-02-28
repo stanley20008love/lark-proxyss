@@ -104,7 +104,7 @@ class EnhancedRiskManager:
         self.price_history: Dict[str, deque] = {}
         
         # 熔断状态
-        self.circuit_breaker_state = CircuitBreaker.CLOSED
+        self.circuit_breaker_state = CircuitBreakerState.CLOSED
         self.circuit_breaker_triggered_at: Optional[datetime] = None
         
         # 波动暂停
@@ -125,9 +125,9 @@ class EnhancedRiskManager:
     def check_can_trade(self, size: float) -> tuple:
         """检查是否可以交易"""
         # 检查熔断状态
-        if self.circuit_breaker_state == CircuitBreaker.OPEN:
+        if self.circuit_breaker_state == CircuitBreakerState.OPEN:
             if self._can_attempt_recovery():
-                self.circuit_breaker_state = CircuitBreaker.HALF_OPEN
+                self.circuit_breaker_state = CircuitBreakerState.HALF_OPEN
                 logger.info("🔄 熔断器进入半开状态，试探性恢复")
             else:
                 return False, "熔断器已触发，交易暂停"
@@ -282,7 +282,7 @@ class EnhancedRiskManager:
     
     def _trigger_circuit_breaker(self, reason: str):
         """触发熔断"""
-        self.circuit_breaker_state = CircuitBreaker.OPEN
+        self.circuit_breaker_state = CircuitBreakerState.OPEN
         self.circuit_breaker_triggered_at = datetime.now()
         
         alert = RiskAlert(
@@ -307,14 +307,14 @@ class EnhancedRiskManager:
     
     def reset_circuit_breaker(self):
         """重置熔断器"""
-        self.circuit_breaker_state = CircuitBreaker.CLOSED
+        self.circuit_breaker_state = CircuitBreakerState.CLOSED
         self.circuit_breaker_triggered_at = None
         logger.info("✅ 熔断器已重置")
     
     def get_risk_level(self) -> RiskLevel:
         """获取风险等级"""
         # 检查熔断
-        if self.circuit_breaker_state == CircuitBreaker.OPEN:
+        if self.circuit_breaker_state == CircuitBreakerState.OPEN:
             return RiskLevel.CRITICAL
         
         # 检查波动暂停
