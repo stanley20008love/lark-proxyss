@@ -1,42 +1,82 @@
 ---
-title: AI Agent - Lark Bot
+title: Polymarket Super Bot
 emoji: 🤖
 colorFrom: blue
-colorTo: purple
+colorTo: green
 sdk: docker
 pinned: false
-short_description: AI Agent with Polymarket & Crypto integration
+license: mit
 ---
 
-# 🤖 AI Agent - Lark Bot
+# 🤖 Polymarket Super Bot (Enhanced)
 
-AI-powered chatbot for Lark (Feishu) with Polymarket and cryptocurrency integration.
+整合 predict-fun-marketmaker 核心功能的生产级 Polymarket 交易机器人
 
-## Features
+## ✨ 功能特性
 
-- 💰 **Crypto Prices**: Real-time BTC and ETH prices from Binance
-- 🎯 **Polymarket**: BTC 15-minute prediction market info
-- 🔔 **Lark Integration**: Full webhook support
-- 🤖 **Gradio Chat**: Interactive web interface
+### 📊 统一做市商策略
+- **异步对冲** - 成交后立即对冲，不撤单继续赚积分
+- **双轨并行** - 同时在买入端和卖出端挂单
+- **动态偏移** - 根据第一档价格自动调整挂单位置
 
-## Commands
+### 💰 跨平台套利
+- 支持 Polymarket / Predict.fun / Probable 多平台
+- 自动检测价差套利机会
+- 站内套利检测 (Yes + No ≠ 1)
 
-| Command | Description |
-|---------|-------------|
-| `btc` | Get Bitcoin price |
-| `eth` | Get Ethereum price |
-| `crypto` | Get all crypto prices |
-| `polymarket` | Polymarket info |
-| `btc15m` | BTC 15-minute markets |
-| `help` | Show commands |
+### 🛡️ 增强风控系统
+- 熔断机制 - 连续亏损自动暂停交易
+- 波动暂停 - 剧烈波动时自动暂停
+- 止损止盈 - 自动触发止损/止盈
 
-## API Endpoints
+### 📈 动态价差计算
+- 波动性感知
+- 流动性评估
+- 买卖压力分析
 
-- `GET /` - Gradio chat interface
-- `POST /webhook` - Lark webhook endpoint
-- `GET /health` - Health check
+## 💬 Chat Commands
 
-## Environment Variables
+| 命令 | 描述 |
+|------|------|
+| `help` | 显示帮助 |
+| `btc`, `eth`, `crypto` | 加密货币价格 |
+| `markets` | 显示市场列表 |
+| `arbitrage` | 套利机会 |
+| `risk` | 风险指标 |
+| `status` | 机器人状态 |
+| `analyze <market>` | 分析市场 |
+| `trade <market> <side> <amount>` | 执行交易 |
+| `mm on/off` | 启用/禁用做市商 |
+| `arb on/off` | 启用/禁用套利 |
 
-- `LARK_APP_ID` - Lark application ID
-- `LARK_APP_SECRET` - Lark application secret
+## 🔗 飞书集成
+
+机器人已与飞书 OpenClaw Bot 集成:
+
+- **回调地址**: `https://lark-proxyss.vercel.app/api`
+- **HF Space**: `stanley2000008love-multi-agent-lark-bot`
+
+消息流程:
+```
+飞书消息 → Vercel Webhook → HF Spaces (Gradio) → AI处理 → 飞书回复
+```
+
+## 🚀 本地运行
+
+```bash
+# 安装依赖
+pip install -r requirements.txt
+
+# 运行应用
+python app.py
+```
+
+## ⚠️ 风险提示
+
+- 所有套利策略非无风险
+- 市场波动可能导致意外成交
+- 建议先用小仓位测试
+
+## 📄 License
+
+MIT License

@@ -1,6 +1,26 @@
-gradio==4.44.0
-huggingface_hub==0.25.0
+# Polymarket Super Bot Requirements (HF Spaces)
+
+# Gradio for UI
+gradio>=4.44.0
+
+# Hugging Face Hub
+huggingface_hub>=0.25.0
+
+# HTTP Client
 httpx>=0.27.0
+aiohttp>=3.9.0
+
+# Web Server
 uvicorn>=0.30.0
 fastapi>=0.111.0
 python-multipart>=0.0.9
+
+# Data Processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Logging
+loguru>=0.7.0
+
+# Type hints
+typing-extensions>=4.8.0
