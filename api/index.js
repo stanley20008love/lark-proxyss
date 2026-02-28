@@ -19,7 +19,7 @@ let botState = {
 
 // 缓存
 let tokenCache = { token: null, expire: 0 };
-let priceCache = { btc: 0, eth: 0, time: 0 };
+let priceCache = { btc: 0, eth: 0, btcChange: 0, ethChange: 0, time: 0 };
 
 // ==================== 飞书 API ====================
 
@@ -89,10 +89,12 @@ async function updateCardMessage(messageId, card) {
 // ==================== 卡片生成器 ====================
 
 function createMainDashboard(prices) {
-  const btcPrice = prices?.btc || 96500;
-  const ethPrice = prices?.eth || 2700;
-  const btcChange = prices?.btcChange || 2.5;
-  const ethChange = prices?.ethChange || 1.8;
+  // 不使用硬编码默认值，直接检查价格是否存在
+  const btcPrice = prices?.btc || 0;
+  const ethPrice = prices?.eth || 0;
+  const btcChange = prices?.btcChange || 0;
+  const ethChange = prices?.ethChange || 0;
+  const hasError = prices?.error || (btcPrice === 0);
   
   return {
     config: { wide_screen_mode: true },
@@ -110,14 +112,18 @@ function createMainDashboard(prices) {
             is_short: true,
             text: {
               tag: 'lark_md',
-              content: `**🪙 BTC/USDT**\n$${btcPrice.toLocaleString()}\n${btcChange >= 0 ? '📈' : '📉'} ${btcChange >= 0 ? '+' : ''}${btcChange}%`
+              content: hasError 
+                ? `**🪙 BTC/USDT**\n❌ ${prices?.error || '获取失败'}\n💡 点击刷新重试`
+                : `**🪙 BTC/USDT**\n$${btcPrice.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}\n${btcChange >= 0 ? '📈' : '📉'} ${btcChange >= 0 ? '+' : ''}${btcChange.toFixed(2)}%`
             }
           },
           {
             is_short: true,
             text: {
               tag: 'lark_md',
-              content: `**💎 ETH/USDT**\n$${ethPrice.toLocaleString()}\n${ethChange >= 0 ? '📈' : '📉'} ${ethChange >= 0 ? '+' : ''}${ethChange}%`
+              content: hasError 
+                ? `**💎 ETH/USDT**\n❌ 获取失败\n📍 数据源: Binance`
+                : `**💎 ETH/USDT**\n$${ethPrice.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}\n${ethChange >= 0 ? '📈' : '📉'} ${ethChange >= 0 ? '+' : ''}${ethChange.toFixed(2)}%`
             }
           }
         ]
@@ -206,7 +212,7 @@ function createMainDashboard(prices) {
       {
         tag: 'note',
         elements: [
-          { tag: 'plain_text', content: `⏰ ${new Date().toLocaleString('zh-CN')} | 策略: ${botState.strategy.toUpperCase()}` }
+          { tag: 'plain_text', content: `⏰ ${new Date().toLocaleString('zh-CN')} | 策略: ${botState.strategy.toUpperCase()} | 数据源: Binance` }
         ]
       }
     ]
@@ -554,24 +560,65 @@ function createTradeConfirmCard(trade) {
 // ==================== 数据获取 ====================
 
 async function getPrices() {
+  // 检查缓存 (5秒有效)
+  const now = Date.now();
+  if (priceCache.btc > 0 && priceCache.eth > 0 && now - priceCache.time < 5000) {
+    return { btc: priceCache.btc, eth: priceCache.eth, btcChange: priceCache.btcChange, ethChange: priceCache.ethChange };
+  }
+  
   try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+    
     const [btcRes, ethRes] = await Promise.all([
-      fetch('https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT'),
-      fetch('https://api.binance.com/api/v3/ticker/24hr?symbol=ETHUSDT')
+      fetch('https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT', { signal: controller.signal }),
+      fetch('https://api.binance.com/api/v3/ticker/24hr?symbol=ETHUSDT', { signal: controller.signal })
     ]);
+    
+    clearTimeout(timeoutId);
     
     const btc = await btcRes.json();
     const eth = await ethRes.json();
     
-    return {
-      btc: parseFloat(btc.lastPrice),
-      eth: parseFloat(eth.lastPrice),
-      btcChange: parseFloat(btc.priceChangePercent),
-      ethChange: parseFloat(eth.priceChangePercent)
+    const result = {
+      btc: parseFloat(btc.lastPrice) || 0,
+      eth: parseFloat(eth.lastPrice) || 0,
+      btcChange: parseFloat(btc.priceChangePercent) || 0,
+      ethChange: parseFloat(eth.priceChangePercent) || 0
     };
+    
+    // 验证数据有效性
+    if (result.btc > 0 && result.eth > 0) {
+      // 更新缓存
+      priceCache = { 
+        btc: result.btc, 
+        eth: result.eth, 
+        btcChange: result.btcChange, 
+        ethChange: result.ethChange,
+        time: now 
+      };
+      return result;
+    }
+    
+    // 数据无效，返回错误
+    return { error: '数据无效', btc: 0, eth: 0, btcChange: 0, ethChange: 0 };
+    
   } catch (e) {
     console.error('Price fetch error:', e);
-    return { btc: 96500, eth: 2700, btcChange: 2.5, ethChange: 1.8 };
+    
+    // 如果有缓存，使用缓存
+    if (priceCache.btc > 0 && priceCache.eth > 0) {
+      return { 
+        btc: priceCache.btc, 
+        eth: priceCache.eth, 
+        btcChange: priceCache.btcChange, 
+        ethChange: priceCache.ethChange,
+        cached: true
+      };
+    }
+    
+    // 没有缓存，返回错误
+    return { error: '网络错误，请稍后重试', btc: 0, eth: 0, btcChange: 0, ethChange: 0 };
   }
 }
 
@@ -799,12 +846,16 @@ async function processMessage(text) {
   
   if (t === 'btc') {
     const prices = await getPrices();
-    return `🪙 BTC/USDT\n💰 $${prices.btc.toLocaleString()}\n${prices.btcChange >= 0 ? '📈' : '📉'} ${prices.btcChange.toFixed(2)}%\n⏰ ${new Date().toLocaleTimeString()}`;
+    if (prices.error) return `❌ ${prices.error}\n💡 请稍后重试`;
+    if (prices.btc === 0) return `❌ 无法获取价格\n💡 请检查网络连接`;
+    return `🪙 BTC/USDT\n💰 $${prices.btc.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}\n${prices.btcChange >= 0 ? '📈' : '📉'} ${prices.btcChange.toFixed(2)}%\n📍 Binance\n⏰ ${new Date().toLocaleTimeString()}`;
   }
   
   if (t === 'eth') {
     const prices = await getPrices();
-    return `💎 ETH/USDT\n💰 $${prices.eth.toLocaleString()}\n${prices.ethChange >= 0 ? '📈' : '📉'} ${prices.ethChange.toFixed(2)}%\n⏰ ${new Date().toLocaleTimeString()}`;
+    if (prices.error) return `❌ ${prices.error}\n💡 请稍后重试`;
+    if (prices.eth === 0) return `❌ 无法获取价格\n💡 请检查网络连接`;
+    return `💎 ETH/USDT\n💰 $${prices.eth.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}\n${prices.ethChange >= 0 ? '📈' : '📉'} ${prices.ethChange.toFixed(2)}%\n📍 Binance\n⏰ ${new Date().toLocaleTimeString()}`;
   }
   
   if (t === 'risk') {
